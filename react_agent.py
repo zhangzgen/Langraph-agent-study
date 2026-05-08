@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import MessagesState, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
@@ -67,7 +68,7 @@ def build_llm() -> ChatOpenAI:
     ).bind_tools(TOOLS)
 
 
-def build_graph():
+def build_graph(with_memory: bool = False):
     llm = build_llm()
 
     def call_llm(state: MessagesState) -> dict[str, list[BaseMessage]]:
@@ -108,7 +109,15 @@ def build_graph():
     # 工具执行完以后回到 llm。
     # 模型会看到 ToolMessage，再决定继续调用工具还是输出最终答案。
     builder.add_edge("tools", "llm")
-    return builder.compile()
+
+    if not with_memory:
+        return builder.compile()
+
+    # checkpointer 是 LangGraph 的“会话记忆”入口。
+    # 同一个 thread_id 下，每次 invoke/stream 只需要传入新增消息；
+    # LangGraph 会从 checkpointer 取出旧 State，再把新消息追加进去。
+    checkpointer = MemorySaver()
+    return builder.compile(checkpointer=checkpointer)
 
 
 def run(question: str, debug: bool = False) -> AIMessage:
@@ -117,16 +126,45 @@ def run(question: str, debug: bool = False) -> AIMessage:
     # 输入状态只需要包含用户消息。
     # 后续 AIMessage 和 ToolMessage 都由图中的节点自动追加。
     inputs = {"messages": [{"role": "user", "content": question}]}
+    return _invoke_graph(graph, inputs, config=None, debug=debug)
 
+
+def chat(thread_id: str = "default", debug: bool = False) -> None:
+    # 多轮对话和单次调用的主要区别：
+    # 1. graph 编译时启用 checkpointer。
+    # 2. 每一轮调用都传同一个 thread_id。
+    # 3. 输入只传本轮用户新消息，历史消息由 LangGraph 自动恢复。
+    graph = build_graph(with_memory=True)
+    config = {"configurable": {"thread_id": thread_id}}
+
+    print("进入多轮对话模式。输入 exit、quit 或 q 结束。")
+    print(f"thread_id: {thread_id}")
+
+    while True:
+        question = input("\n你: ").strip()
+        if question.lower() in {"exit", "quit", "q"}:
+            print("已结束多轮对话。")
+            return
+        if not question:
+            continue
+
+        inputs = {"messages": [{"role": "user", "content": question}]}
+        final_message = _invoke_graph(graph, inputs, config=config, debug=debug)
+        print(f"\n助手: {final_message.content}")
+
+
+def _invoke_graph(graph, inputs: dict, config: dict | None, debug: bool) -> AIMessage:
+    # 单次问答和多轮问答都可以复用这个执行函数。
+    # debug=True 时打印每个 node 的增量输出，方便观察 ReAct 路由。
     if not debug:
         # invoke 会一次性跑完整张图，直到 END。
-        result = graph.invoke(inputs)
+        result = graph.invoke(inputs, config=config)
         return result["messages"][-1]
 
     # debug 模式用 stream 查看每个节点的增量输出。
     # 这对学习 ReAct 很有用：可以看到 llm -> tools -> llm 的实际跳转。
     final_message: AIMessage | None = None
-    for event in graph.stream(inputs, stream_mode="updates"):
+    for event in graph.stream(inputs, config=config, stream_mode="updates"):
         for node_name, update in event.items():
             print(f"\n[{node_name}]")
             for message in update.get("messages", []):
@@ -184,8 +222,18 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Run a minimal LangGraph ReAct agent.")
     parser.add_argument("question", nargs="?", default="北京现在几点？再计算 23 * 47。")
+    parser.add_argument("--chat", action="store_true", help="Start multi-turn chat mode.")
     parser.add_argument("--debug", action="store_true", help="Print graph updates.")
+    parser.add_argument(
+        "--thread-id",
+        default="default",
+        help="Conversation id used by LangGraph checkpointer in chat mode.",
+    )
     args = parser.parse_args()
+
+    if args.chat:
+        chat(thread_id=args.thread_id, debug=args.debug)
+        return
 
     final_message = run(args.question, debug=args.debug)
     print("\nFinal answer:")

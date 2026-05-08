@@ -63,6 +63,36 @@ uv run python react_agent.py "北京现在几点？顺便算一下 23 * 47"
 python react_agent.py --debug "北京现在几点？顺便算一下 23 * 47"
 ```
 
+启动多轮对话：
+
+```bash
+python react_agent.py --chat
+```
+
+如果用 `uv`：
+
+```bash
+uv run python react_agent.py --chat
+```
+
+多轮对话也可以打开 debug，观察每一轮内部是否进入工具节点：
+
+```bash
+uv run python react_agent.py --chat --debug
+```
+
+指定一个会话 ID：
+
+```bash
+uv run python react_agent.py --chat --thread-id study-session-1
+```
+
+退出多轮对话时输入：
+
+```text
+exit
+```
+
 ## 关键代码
 
 核心图结构在 `build_graph()`：
@@ -84,6 +114,35 @@ ReAct 的关键点不是某个神秘框架 API，而是：
 3. `ToolNode` 把工具结果追加为 `ToolMessage`。
 4. 图回到 `llm` node，模型读取工具结果后继续推理。
 5. 当模型不再返回 `tool_calls`，条件边路由到 `END`。
+
+## 多轮对话
+
+单次问答时，每次调用只传入当前用户问题：
+
+```python
+graph.invoke({"messages": [{"role": "user", "content": question}]})
+```
+
+多轮对话需要让图记住之前的 `messages`。这个项目使用 LangGraph 的 `MemorySaver` 作为 checkpointer：
+
+```python
+checkpointer = MemorySaver()
+graph = builder.compile(checkpointer=checkpointer)
+```
+
+每一轮调用时传入同一个 `thread_id`：
+
+```python
+config = {"configurable": {"thread_id": "default"}}
+graph.invoke(
+    {"messages": [{"role": "user", "content": question}]},
+    config=config,
+)
+```
+
+这样你每一轮只需要传“新增的用户消息”。LangGraph 会根据 `thread_id` 取回上一轮保存的 State，再把新消息追加进去。
+
+内存中的多轮历史只在当前进程内有效。程序退出后，`MemorySaver` 里的历史会消失。后续如果需要持久化，可以换成数据库型 checkpointer。
 
 ## 注意
 
