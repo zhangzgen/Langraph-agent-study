@@ -1,0 +1,21 @@
+[project]
+name = "langraph-agent"
+version = "0.1.0"
+description = "A minimal LangGraph ReAct agent demo using an OpenAI-compatible Xiaomi model endpoint."
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.0.0",
+    "langchain-core>=1.0.0",
+    "langchain-openai>=1.0.0",
+    "python-dotenv>=1.0.1",
+]
+
+[project.scripts]
+react-agent = "react_agent:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["react_agent"]

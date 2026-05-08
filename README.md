@@ -1,0 +1,90 @@
+# LangGraph ReAct Agent Demo
+
+这个项目演示如何用 LangGraph 手写一个 ReAct agent。你已经了解 `Node`、`State`、`Edge`，所以重点放在 ReAct 循环：
+
+```text
+START -> llm -> tools? -> llm -> ... -> END
+```
+
+其中：
+
+- `State`: 使用 LangGraph 内置的 `MessagesState`，核心字段是 `messages`。
+- `llm` node: 调用小米 OpenAI 兼容接口，并让模型决定是否调用工具。
+- `tools` node: 使用 `ToolNode` 执行模型请求的工具调用。
+- `conditional edge`: 使用 `tools_condition` 检查上一条 AI 消息里是否有 `tool_calls`。有就进入 `tools`，没有就结束。
+
+## 安装
+
+推荐使用 `uv`：
+
+```bash
+uv sync
+```
+
+或者使用标准 venv：
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+## 配置
+
+不要把真实 AK 写进代码。复制环境变量模板：
+
+```bash
+cp .env.example .env
+```
+
+然后编辑 `.env`：
+
+```bash
+XIAOMI_API_KEY=你的真实 AK
+XIAOMI_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
+XIAOMI_MODEL=mimo-v2.5-pro
+```
+
+## 运行
+
+```bash
+python react_agent.py "北京现在几点？顺便算一下 23 * 47"
+```
+
+如果用 `uv`：
+
+```bash
+uv run python react_agent.py "北京现在几点？顺便算一下 23 * 47"
+```
+
+查看每一步图执行过程：
+
+```bash
+python react_agent.py --debug "北京现在几点？顺便算一下 23 * 47"
+```
+
+## 关键代码
+
+核心图结构在 `build_graph()`：
+
+```python
+builder = StateGraph(MessagesState)
+builder.add_node("llm", call_llm)
+builder.add_node("tools", ToolNode(tools))
+builder.add_edge(START, "llm")
+builder.add_conditional_edges("llm", tools_condition)
+builder.add_edge("tools", "llm")
+graph = builder.compile()
+```
+
+ReAct 的关键点不是某个神秘框架 API，而是：
+
+1. 模型先推理并决定是否需要工具。
+2. 如果返回 `tool_calls`，条件边把状态路由到 `tools` node。
+3. `ToolNode` 把工具结果追加为 `ToolMessage`。
+4. 图回到 `llm` node，模型读取工具结果后继续推理。
+5. 当模型不再返回 `tool_calls`，条件边路由到 `END`。
+
+## 注意
+
+这个实现依赖模型支持 OpenAI 兼容的 tool calling。如果 `mimo-v2.5-pro` 没有按 OpenAI 格式返回 `tool_calls`，`tools_condition` 就不会进入工具节点。届时可以改成“文本 ReAct 格式 + 自定义 parser”的方案。
