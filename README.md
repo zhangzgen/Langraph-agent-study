@@ -93,6 +93,12 @@ uv run python react_agent.py --chat --thread-id study-session-1
 exit
 ```
 
+查看当前扫描到的 Skill 元数据：
+
+```bash
+uv run python react_agent.py --list-skills
+```
+
 ## 关键代码
 
 核心图结构在 `build_graph()`：
@@ -143,6 +149,47 @@ graph.invoke(
 这样你每一轮只需要传“新增的用户消息”。LangGraph 会根据 `thread_id` 取回上一轮保存的 State，再把新消息追加进去。
 
 内存中的多轮历史只在当前进程内有效。程序退出后，`MemorySaver` 里的历史会消失。后续如果需要持久化，可以换成数据库型 checkpointer。
+
+## 动态 Skill
+
+项目内的 Skill 放在 `skills/` 目录，每个 Skill 是一个独立文件夹，必须包含 `SKILL.md`：
+
+```text
+skills/
+├── langgraph-react-tutor/
+│   └── SKILL.md
+└── python-debug-helper/
+    └── SKILL.md
+```
+
+`SKILL.md` 使用标准 Skill 格式，开头是 YAML frontmatter，并且至少包含 `name` 和 `description`：
+
+```markdown
+---
+name: langgraph-react-tutor
+description: Explain LangGraph Agent and ReAct mechanisms in Chinese...
+---
+
+# LangGraph ReAct Tutor
+
+...
+```
+
+当前实现采用 progressive disclosure：
+
+1. 启动图时扫描 `skills/*/SKILL.md`。
+2. 只读取 YAML frontmatter 中的 `name` 和 `description`。
+3. 把 Skill 元数据放入 system message，让模型判断是否需要某个 Skill。
+4. 如果用户请求匹配某个 Skill，模型会调用 `load_skill(skill_name)`。
+5. `load_skill` 再读取完整 `SKILL.md` 正文，并把说明作为工具结果返回给模型。
+
+Skill 不是普通工具的替代品。它提供行为说明和工作流；需要计算、时间或其他外部能力时，Agent 仍然可以继续调用 `calculator`、`current_time` 等 tools。
+
+可以通过环境变量切换 Skill 目录：
+
+```bash
+AGENT_SKILLS_DIR=/path/to/skills uv run python react_agent.py --list-skills
+```
 
 ## 注意
 

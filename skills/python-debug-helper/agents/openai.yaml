@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python Debug Helper"
+  short_description: "Debug Python tracebacks and environment issues"
+  default_prompt: "Help debug this Python error"

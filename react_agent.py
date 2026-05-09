@@ -4,10 +4,13 @@ import argparse
 import ast
 import operator
 import os
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+import yaml
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import tool
@@ -19,6 +22,15 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 XIAOMI_DEFAULT_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
 XIAOMI_DEFAULT_MODEL = "mimo-v2.5-pro"
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_SKILLS_DIR = PROJECT_ROOT / "skills"
+
+
+@dataclass(frozen=True)
+class SkillMetadata:
+    name: str
+    description: str
+    path: Path
 
 
 @tool
@@ -44,10 +56,43 @@ def current_time(timezone: str = "Asia/Shanghai") -> str:
     return now.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-# 工具列表会同时传给两处：
-# 1. llm.bind_tools(TOOLS): 告诉模型“你可以调用这些工具”。
-# 2. ToolNode(TOOLS): 真正执行模型请求的工具调用。
-TOOLS = [calculator, current_time]
+# 基础工具列表会同时传给两处：
+# 1. llm.bind_tools(BASE_TOOLS): 告诉模型“你可以调用这些普通工具”。
+# 2. ToolNode(TOOLS): 真正执行模型请求的所有工具调用，包括 Skill 工具。
+BASE_TOOLS = [calculator, current_time]
+
+
+@tool
+def list_skills() -> str:
+    """列出当前项目 skills 目录中可用 Skill 的名称和描述。"""
+    skills = discover_skills()
+    if not skills:
+        return "当前没有发现可用 Skill。"
+    return _format_skill_catalog(skills)
+
+
+@tool
+def load_skill(skill_name: str) -> str:
+    """按 Skill 名称加载完整 SKILL.md 说明正文。"""
+    # 这是 Skill 机制的“按需加载”入口。
+    # 模型启动时只看到 YAML 元数据；判断需要某个 Skill 后，再调用这个工具加载正文。
+    skill = find_skill(skill_name)
+    if skill is None:
+        available = ", ".join(item.name for item in discover_skills()) or "无"
+        return f"没有找到 Skill: {skill_name}。可用 Skill: {available}"
+
+    content = skill.path.read_text(encoding="utf-8")
+    metadata, body = split_skill_file(content)
+    description = metadata.get("description", skill.description)
+    return (
+        f"Skill 名称: {skill.name}\n"
+        f"Skill 描述: {description}\n\n"
+        f"完整说明:\n{body.strip()}"
+    )
+
+
+SKILL_TOOLS = [list_skills, load_skill]
+TOOLS = [*BASE_TOOLS, *SKILL_TOOLS]
 
 
 def build_llm() -> ChatOpenAI:
@@ -70,6 +115,7 @@ def build_llm() -> ChatOpenAI:
 
 def build_graph(with_memory: bool = False):
     llm = build_llm()
+    skill_catalog = _format_skill_catalog(discover_skills())
 
     def call_llm(state: MessagesState) -> dict[str, list[BaseMessage]]:
         # MessagesState 是 LangGraph 内置 State，结构类似：
@@ -80,6 +126,12 @@ def build_graph(with_memory: bool = False):
             "content": (
                 "你是一个会使用工具的 ReAct agent。"
                 "需要实时信息或计算时先调用工具，拿到工具结果后再给最终回答。"
+                "\n\n你还具备动态 Skill 能力。启动时你只会看到每个 Skill 的 YAML 元数据。"
+                "如果用户请求匹配某个 Skill 的 description，必须先调用 load_skill(skill_name) "
+                "读取完整技能说明，再按照该 Skill 回答。"
+                "如果不确定有哪些 Skill，可以调用 list_skills。"
+                "Skill 是行为说明，不替代工具；需要计算或实时信息时仍然继续调用工具。"
+                f"\n\n当前可用 Skill 元数据:\n{skill_catalog}"
             ),
         }
         # 这里是 ReAct 中的“Reason/Act 决策”阶段：
@@ -185,6 +237,73 @@ def _format_message(message: BaseMessage) -> str:
     return f"{message.type}: {message.content}"
 
 
+def get_skills_dir() -> Path:
+    # 可通过 AGENT_SKILLS_DIR 覆盖默认目录，便于后续实验不同 Skill 集合。
+    return Path(os.getenv("AGENT_SKILLS_DIR", DEFAULT_SKILLS_DIR)).expanduser()
+
+
+def discover_skills() -> list[SkillMetadata]:
+    # 只读取 SKILL.md 的 YAML frontmatter，不加载正文。
+    # 这对应 Skill 的第一层 progressive disclosure：name + description。
+    skills_dir = get_skills_dir()
+    if not skills_dir.exists():
+        return []
+
+    skills: list[SkillMetadata] = []
+    for skill_file in sorted(skills_dir.glob("*/SKILL.md")):
+        try:
+            metadata, _body = split_skill_file(skill_file.read_text(encoding="utf-8"))
+        except ValueError:
+            continue
+
+        name = metadata.get("name")
+        description = metadata.get("description")
+        if not isinstance(name, str) or not isinstance(description, str):
+            continue
+        skills.append(
+            SkillMetadata(
+                name=name.strip(),
+                description=description.strip(),
+                path=skill_file,
+            )
+        )
+    return skills
+
+
+def find_skill(skill_name: str) -> SkillMetadata | None:
+    normalized = skill_name.strip().lower()
+    for skill in discover_skills():
+        if skill.name.lower() == normalized:
+            return skill
+    return None
+
+
+def split_skill_file(content: str) -> tuple[dict, str]:
+    if not content.startswith("---\n"):
+        raise ValueError("SKILL.md 必须以 YAML frontmatter 开始。")
+
+    marker = "\n---\n"
+    end = content.find(marker, 4)
+    if end == -1:
+        raise ValueError("SKILL.md 缺少 YAML frontmatter 结束标记。")
+
+    frontmatter = content[4:end]
+    body = content[end + len(marker) :]
+    metadata = yaml.safe_load(frontmatter) or {}
+    if not isinstance(metadata, dict):
+        raise ValueError("SKILL.md frontmatter 必须是 YAML mapping。")
+    return metadata, body
+
+
+def _format_skill_catalog(skills: list[SkillMetadata]) -> str:
+    if not skills:
+        return "无"
+    return "\n".join(
+        f"- name: {skill.name}\n  description: {skill.description}"
+        for skill in skills
+    )
+
+
 def _safe_eval(expression: str) -> int | float:
     # 不使用 eval，改用 ast 白名单，只允许基础算术节点。
     # 这是示例工具的安全边界，避免执行任意 Python 代码。
@@ -229,7 +348,12 @@ def main() -> None:
         default="default",
         help="Conversation id used by LangGraph checkpointer in chat mode.",
     )
+    parser.add_argument("--list-skills", action="store_true", help="Print discovered skills.")
     args = parser.parse_args()
+
+    if args.list_skills:
+        print(_format_skill_catalog(discover_skills()))
+        return
 
     if args.chat:
         chat(thread_id=args.thread_id, debug=args.debug)

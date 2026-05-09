@@ -1,0 +1,4 @@
+interface:
+  display_name: "LangGraph ReAct Tutor"
+  short_description: "Explain LangGraph ReAct agent concepts and code"
+  default_prompt: "Explain this LangGraph ReAct agent step by step"
