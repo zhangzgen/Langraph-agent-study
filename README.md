@@ -13,6 +13,32 @@ START -> llm -> tools? -> llm -> ... -> END
 - `tools` node: 使用 `ToolNode` 执行模型请求的工具调用。
 - `conditional edge`: 使用 `tools_condition` 检查上一条 AI 消息里是否有 `tool_calls`。有就进入 `tools`，没有就结束。
 
+## 项目结构
+
+项目已按职责拆分，`react_agent.py` 只保留兼容入口，核心代码放在 `langraph_agent/` 包里：
+
+```text
+langraph_agent/
+├── cli.py                 # 命令行参数、.env 加载、入口调度
+├── config.py              # 默认模型、项目路径、超时和输出限制等配置
+├── graph.py               # LangGraph ReAct 图、多轮对话、debug 输出
+├── llm.py                 # ChatOpenAI / 小米兼容接口初始化
+├── models.py              # 项目内共享数据结构
+├── skills/
+│   └── registry.py        # Skill 发现、frontmatter 解析和目录定位
+└── tools/
+    ├── basic.py           # calculator、current_time 等基础工具
+    ├── shell.py           # bash 工具和命令安全策略
+    └── skill_tools.py     # list_skills、load_skill 工具
+```
+
+后续扩展时建议：
+
+- 新增普通工具：放到 `langraph_agent/tools/` 下的同类文件中，并在 `langraph_agent/tools/__init__.py` 注册到 `TOOLS`。
+- 新增 Skill：继续放到项目根目录的 `skills/<skill-name>/SKILL.md`，不需要改 Python 代码。
+- 修改模型或 API 默认值：优先改 `langraph_agent/config.py`，运行时差异继续用环境变量覆盖。
+- 修改图结构或多轮记忆行为：集中改 `langraph_agent/graph.py`。
+
 ## 安装
 
 推荐使用 `uv`：
@@ -109,12 +135,12 @@ uv run python react_agent.py --list-skills
 
 ## 关键代码
 
-核心图结构在 `build_graph()`：
+核心图结构在 `langraph_agent/graph.py` 的 `build_graph()`：
 
 ```python
 builder = StateGraph(MessagesState)
 builder.add_node("llm", call_llm)
-builder.add_node("tools", ToolNode(tools))
+builder.add_node("tools", ToolNode(TOOLS))
 builder.add_edge(START, "llm")
 builder.add_conditional_edges("llm", tools_condition)
 builder.add_edge("tools", "llm")
