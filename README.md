@@ -133,6 +133,21 @@ exit
 uv run python react_agent.py --list-skills
 ```
 
+## 测试
+
+项目使用 `pytest` 做自动化测试，测试代码放在 `tests/` 目录。当前测试主要覆盖：
+
+- `calculator` 和安全算术解析。
+- Skill frontmatter 解析、目录扫描和 catalog 格式化。
+- `bash` 工具的危险命令拦截、白名单判断和基础执行路径。
+- CLI 的 `--list-skills` 路径，避免依赖真实模型 API Key。
+
+运行测试：
+
+```bash
+uv run pytest
+```
+
 ## 关键代码
 
 核心图结构在 `langraph_agent/graph.py` 的 `build_graph()`：

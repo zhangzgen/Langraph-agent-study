@@ -97,7 +97,31 @@ def _is_dangerous_command(command: str) -> bool:
     # 对整条命令做正则匹配，覆盖明显破坏性操作。
     # 这一步优先于白名单判断，避免 `find . -delete` 这类命令被 find 白名单放过。
     lowered = command.lower()
+    if _is_dangerous_rm_command(command):
+        return True
     return any(re.search(pattern, lowered) for pattern in DANGEROUS_COMMAND_PATTERNS)
+
+
+def _is_dangerous_rm_command(command: str) -> bool:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+
+    if not parts or parts[0] != "rm":
+        return False
+
+    options = [part for part in parts[1:] if part.startswith("-")]
+    has_recursive = any(
+        option in {"-r", "-R", "--recursive"}
+        or (option.startswith("-") and "r" in option.lower())
+        for option in options
+    )
+    has_force = any(
+        option == "--force" or (option.startswith("-") and "f" in option.lower())
+        for option in options
+    )
+    return has_recursive and has_force
 
 
 def _is_directly_allowed_command(command: str) -> bool:
@@ -141,7 +165,7 @@ def _confirm_execution(tool_name: str, command: str) -> bool:
     print(command)
     try:
         answer = input("确认执行？输入 y 或 yes 继续: ").strip().lower()
-    except EOFError:
+    except (EOFError, OSError):
         return False
     return answer in {"y", "yes"}
 
