@@ -48,3 +48,9 @@ LangChainPendingDeprecationWarning
 ```
 
 Explain that this is not fatal unless execution stops with an exception.
+
+## Scripts
+
+Use `bash` for scripts in this Skill after confirming the script path.
+
+- `environment_report.py`: Print Python, platform, and key package versions. Use when debugging local environment or dependency issues.

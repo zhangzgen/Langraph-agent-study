@@ -4,6 +4,9 @@ import argparse
 import ast
 import operator
 import os
+import re
+import shlex
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +27,70 @@ XIAOMI_DEFAULT_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
 XIAOMI_DEFAULT_MODEL = "mimo-v2.5-pro"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SKILLS_DIR = PROJECT_ROOT / "skills"
+COMMAND_TIMEOUT_SECONDS = 30
+OUTPUT_LIMIT = 8000
+
+# 危险名单：匹配到这些模式时直接拒绝执行。
+# 这里故意使用“偏保守”的规则，因为 bash 是能修改本机文件系统的高权限工具。
+DANGEROUS_COMMAND_PATTERNS = [
+    r"\brm\s+.*(-r|-R|--recursive).*(-f|--force)",
+    r"\bsudo\b",
+    r"\bsu\b",
+    r"\bchmod\s+.*777\b",
+    r"\bchown\s+.*(-r|-R|--recursive)",
+    r"\bfind\b.*\s-delete\b",
+    r"\bxargs\b.*\brm\b",
+    r"\bgit\s+reset\b.*--hard\b",
+    r"\bgit\s+clean\b.*-[^\s]*f",
+    r"\bmkfs\b",
+    r"\bdd\s+.*\bof=",
+    r"\bdiskutil\s+erase",
+    r"\bshutdown\b",
+    r"\breboot\b",
+    r"\bhalt\b",
+    r"\bpoweroff\b",
+    r"\bkill\s+-9\s+-1\b",
+    r"\bpkill\b",
+    r"\bkillall\b",
+    r":\s*\(\s*\)\s*\{",
+    r"(curl|wget)\b.*\|\s*(sh|bash|zsh|python|python3)\b",
+]
+
+# 如果命令包含管道、重定向、命令替换或多命令串联，就不走直接执行白名单。
+# 例如 `cat file | sh` 即使以 cat 开头，也必须要求用户确认。
+SHELL_CONTROL_OPERATORS = (";", "&&", "||", "|", ">", "<", "`", "$(", "\n")
+
+# 直接执行白名单：主要放只读或低风险命令。
+# 注意：命令在进入白名单前还会经过危险名单和参数级检查。
+DIRECT_ALLOWLIST_COMMANDS = {
+    "pwd",
+    "ls",
+    "find",
+    "rg",
+    "grep",
+    "cat",
+    "sed",
+    "awk",
+    "head",
+    "tail",
+    "wc",
+    "date",
+    "whoami",
+    "which",
+    "echo",
+}
+DIRECT_ALLOWLIST_PREFIXES = (
+    ("git", "status"),
+    ("git", "diff"),
+    ("git", "log"),
+    ("git", "show"),
+    ("git", "branch"),
+    ("git", "remote"),
+    ("python", "--version"),
+    ("python3", "--version"),
+    ("uv", "--version"),
+    ("uv", "run", "python", "-m", "compileall"),
+)
 
 
 @dataclass(frozen=True)
@@ -63,6 +130,26 @@ BASE_TOOLS = [calculator, current_time]
 
 
 @tool
+def bash(command: str, timeout_seconds: int = COMMAND_TIMEOUT_SECONDS) -> str:
+    """执行 bash 命令。白名单命令直接执行，非白名单命令需要用户确认，危险命令会被拦截。"""
+    # 这是一个高权限工具，故意把安全策略放在工具内部，而不是完全依赖模型自觉。
+    # Skill 脚本也通过这个工具执行，例如：
+    # bash("uv run python skills/python-debug-helper/scripts/environment_report.py")
+    command = command.strip()
+    if not command:
+        return "命令为空，未执行。"
+
+    if _is_dangerous_command(command):
+        return f"已拦截危险命令，未执行: {command}"
+
+    if not _is_directly_allowed_command(command):
+        if not _confirm_execution("bash", command):
+            return f"用户未确认，命令未执行: {command}"
+
+    return _run_shell_command(command, timeout_seconds=timeout_seconds)
+
+
+@tool
 def list_skills() -> str:
     """列出当前项目 skills 目录中可用 Skill 的名称和描述。"""
     skills = discover_skills()
@@ -92,7 +179,8 @@ def load_skill(skill_name: str) -> str:
 
 
 SKILL_TOOLS = [list_skills, load_skill]
-TOOLS = [*BASE_TOOLS, *SKILL_TOOLS]
+EXECUTION_TOOLS = [bash]
+TOOLS = [*BASE_TOOLS, *SKILL_TOOLS, *EXECUTION_TOOLS]
 
 
 def build_llm() -> ChatOpenAI:
@@ -131,6 +219,9 @@ def build_graph(with_memory: bool = False):
                 "读取完整技能说明，再按照该 Skill 回答。"
                 "如果不确定有哪些 Skill，可以调用 list_skills。"
                 "Skill 是行为说明，不替代工具；需要计算或实时信息时仍然继续调用工具。"
+                "\n\n你还可以使用 bash 执行本地命令和 Skill 自带脚本。"
+                "执行 Skill 脚本时，先通过 load_skill 读取脚本说明，再用 bash 运行 scripts/ 下的脚本。"
+                "不要尝试绕过确认；如果命令被拦截，需要向用户解释原因。"
                 f"\n\n当前可用 Skill 元数据:\n{skill_catalog}"
             ),
         }
@@ -202,7 +293,8 @@ def chat(thread_id: str = "default", debug: bool = False) -> None:
 
         inputs = {"messages": [{"role": "user", "content": question}]}
         final_message = _invoke_graph(graph, inputs, config=config, debug=debug)
-        print(f"\n助手: {final_message.content}")
+        if not debug:
+            print(f"\n助手: {final_message.content}")
 
 
 def _invoke_graph(graph, inputs: dict, config: dict | None, debug: bool) -> AIMessage:
@@ -230,11 +322,64 @@ def _invoke_graph(graph, inputs: dict, config: dict | None, debug: bool) -> AIMe
 
 
 def _format_message(message: BaseMessage) -> str:
-    # debug 打印时，如果模型请求工具调用，优先展示 tool_calls。
+    # debug 打印时尽量把“模型推理字段 / 工具调用 / 最终内容”分开。
+    # 不同 OpenAI 兼容模型暴露 reasoning 的字段名可能不同，所以这里做兼容式读取。
+    parts = [f"{message.type}:"]
+
+    reasoning = _extract_reasoning_text(message)
+    if reasoning:
+        parts.append(f"reasoning:\n{reasoning}")
+
     tool_calls = getattr(message, "tool_calls", None)
     if tool_calls:
-        return f"{message.type}: tool_calls={tool_calls}"
-    return f"{message.type}: {message.content}"
+        parts.append(f"tool_calls={tool_calls}")
+
+    if message.content:
+        parts.append(f"content:\n{message.content}")
+
+    return "\n".join(parts)
+
+
+def _extract_reasoning_text(message: BaseMessage) -> str:
+    # 一些模型会把“思考内容”放在 additional_kwargs 或 response_metadata。
+    # 如果没有这些字段，就返回空字符串，debug 输出中也不会展示 reasoning 区块。
+    candidates = []
+    for container_name in ("additional_kwargs", "response_metadata"):
+        container = getattr(message, container_name, None)
+        if isinstance(container, dict):
+            candidates.extend(
+                container.get(key)
+                for key in (
+                    "reasoning_content",
+                    "reasoning",
+                    "reasoning_text",
+                    "thinking",
+                    "thought",
+                )
+            )
+
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, list):
+            text = _extract_text_from_reasoning_blocks(value)
+            if text:
+                return text
+    return ""
+
+
+def _extract_text_from_reasoning_blocks(blocks: list) -> str:
+    texts = []
+    for block in blocks:
+        if isinstance(block, str):
+            texts.append(block)
+        elif isinstance(block, dict):
+            for key in ("text", "content", "summary"):
+                value = block.get(key)
+                if isinstance(value, str) and value.strip():
+                    texts.append(value.strip())
+                    break
+    return "\n".join(texts).strip()
 
 
 def get_skills_dir() -> Path:
@@ -304,6 +449,102 @@ def _format_skill_catalog(skills: list[SkillMetadata]) -> str:
     )
 
 
+def _is_dangerous_command(command: str) -> bool:
+    # 对整条命令做正则匹配，覆盖明显破坏性操作。
+    # 这一步优先于白名单判断，避免 `find . -delete` 这类命令被 find 白名单放过。
+    lowered = command.lower()
+    return any(re.search(pattern, lowered) for pattern in DANGEROUS_COMMAND_PATTERNS)
+
+
+def _is_directly_allowed_command(command: str) -> bool:
+    # 白名单只允许“单条简单命令”直接执行。
+    # 只要出现 shell 控制符，就必须走用户确认。
+    if any(operator in command for operator in SHELL_CONTROL_OPERATORS):
+        return False
+
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+
+    if not parts:
+        return False
+    if _has_disallowed_allowlist_options(parts):
+        return False
+    if parts[0] in DIRECT_ALLOWLIST_COMMANDS:
+        return True
+    return any(tuple(parts[: len(prefix)]) == prefix for prefix in DIRECT_ALLOWLIST_PREFIXES)
+
+
+def _has_disallowed_allowlist_options(parts: list[str]) -> bool:
+    # 某些命令整体看似只读，但特定参数会产生破坏性副作用。
+    # 这些参数会让命令退出白名单，转入用户确认或危险拦截。
+    if parts[0] == "sed" and "-i" in parts:
+        return True
+    if parts[0] == "find" and any(part in {"-delete", "-exec", "-execdir"} for part in parts):
+        return True
+    if parts[:2] == ["git", "branch"] and any(part in {"-d", "-D", "--delete"} for part in parts):
+        return True
+    if parts[:2] == ["git", "remote"] and len(parts) > 2:
+        return parts[2] not in {"-v", "show", "get-url"}
+    return False
+
+
+def _confirm_execution(tool_name: str, command: str) -> bool:
+    # 非白名单命令需要人类在终端显式输入 y/yes。
+    # 如果运行环境没有 stdin，EOFError 会被视为拒绝执行。
+    print(f"\n[{tool_name}] 即将执行需要确认的命令:")
+    print(command)
+    try:
+        answer = input("确认执行？输入 y 或 yes 继续: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def _run_shell_command(command: str, timeout_seconds: int) -> str:
+    # 统一在项目根目录执行，便于命令使用相对路径。
+    return _run_process(
+        ["bash", "-lc", command],
+        cwd=PROJECT_ROOT,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _run_process(command: list[str], cwd: Path, timeout_seconds: int) -> str:
+    # 所有进程执行都收敛到这里，统一处理 timeout、stdout/stderr 和输出截断。
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            timeout=max(1, timeout_seconds),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return f"命令超时，已终止。timeout={exc.timeout}s"
+    except ValueError as exc:
+        return str(exc)
+    except OSError as exc:
+        return f"命令执行失败: {exc}"
+
+    stdout = _truncate_output(completed.stdout.strip())
+    stderr = _truncate_output(completed.stderr.strip())
+    sections = [f"exit_code: {completed.returncode}"]
+    if stdout:
+        sections.append(f"stdout:\n{stdout}")
+    if stderr:
+        sections.append(f"stderr:\n{stderr}")
+    return "\n\n".join(sections)
+
+
+def _truncate_output(output: str) -> str:
+    if len(output) <= OUTPUT_LIMIT:
+        return output
+    return output[:OUTPUT_LIMIT] + "\n...[output truncated]"
+
+
 def _safe_eval(expression: str) -> int | float:
     # 不使用 eval，改用 ast 白名单，只允许基础算术节点。
     # 这是示例工具的安全边界，避免执行任意 Python 代码。
@@ -360,6 +601,9 @@ def main() -> None:
         return
 
     final_message = run(args.question, debug=args.debug)
+    if args.debug:
+        return
+
     print("\nFinal answer:")
     print(final_message.content)
 

@@ -34,6 +34,7 @@ Use these mappings when explaining this project:
 - When a question involves calculations or current time, still use the available tools.
 - When explaining Skill loading, distinguish metadata loading from full instruction loading.
 - Do not describe Skill bodies as always in context; only name and description are loaded at startup.
+- If a Skill script is needed, execute the script with `bash` after confirming the script path from the loaded Skill instructions.
 
 ## Useful Diagrams
 
