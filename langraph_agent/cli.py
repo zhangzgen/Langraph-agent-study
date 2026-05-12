@@ -20,6 +20,14 @@ def main() -> None:
         default="default",
         help="Conversation id used by LangGraph checkpointer in chat mode.",
     )
+    parser.add_argument(
+        "--checkpoint-db",
+        default=None,
+        help=(
+            "SQLite checkpoint database path. Defaults to data/checkpoints.sqlite "
+            "or LANGRAPH_CHECKPOINT_DB_PATH."
+        ),
+    )
     parser.add_argument("--list-skills", action="store_true", help="Print discovered skills.")
     args = parser.parse_args()
 
@@ -30,12 +38,20 @@ def main() -> None:
     if args.chat:
         from langraph_agent.graph import chat
 
-        chat(thread_id=args.thread_id, debug=args.debug)
+        chat(
+            thread_id=args.thread_id,
+            debug=args.debug,
+            checkpoint_db_path=args.checkpoint_db,
+        )
         return
 
     from langraph_agent.graph import run
 
-    final_message = run(args.question, debug=args.debug)
+    final_message = run(
+        args.question,
+        debug=args.debug,
+        checkpoint_db_path=args.checkpoint_db,
+    )
     if args.debug:
         return
 

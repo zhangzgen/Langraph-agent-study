@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 
 from langchain_core.messages import AIMessage, BaseMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from langraph_agent.checkpoints import resolve_checkpoint_db_path, sqlite_checkpointer
 from langraph_agent.llm import build_llm
 from langraph_agent.models import AgentState
 from langraph_agent.skills.registry import discover_skills, format_skill_catalog
@@ -20,7 +23,10 @@ from langraph_agent.tool_guard import (
 )
 
 
-def build_graph(with_memory: bool = False):
+def build_graph(
+    with_memory: bool = False,
+    checkpointer: BaseCheckpointSaver | None = None,
+):
     """构建 LangGraph ReAct 状态机，并按需启用 checkpointer。"""
     llm = build_llm()
     skill_catalog = format_skill_catalog(discover_skills())
@@ -83,6 +89,9 @@ def build_graph(with_memory: bool = False):
     # 工具执行完以后回到 llm。模型会看到 ToolMessage，再决定继续调用工具还是输出最终答案。
     builder.add_edge("execute_tools", "llm")
 
+    if checkpointer is not None:
+        return builder.compile(checkpointer=checkpointer)
+
     if not with_memory:
         return builder.compile()
 
@@ -103,37 +112,48 @@ def _route_after_classify(state: AgentState) -> str:
     return "approval_gate" if has_pending_approvals(state) else "execute_tools"
 
 
-def run(question: str, debug: bool = False) -> AIMessage:
-    """运行一次性问答；启用 checkpointer 以支持工具审批恢复。"""
-    graph = build_graph(with_memory=True)
-
+def run(
+    question: str,
+    debug: bool = False,
+    checkpoint_db_path: str | Path | None = None,
+) -> AIMessage:
+    """运行一次性问答；启用 SQLite checkpointer 以支持工具审批恢复。"""
     inputs = {"messages": [{"role": "user", "content": question}]}
     # 单次 run 也启用 checkpointer，因为 interrupt/resume 需要 thread_id
     # 找回暂停时的图状态。
     config = {"configurable": {"thread_id": f"run-{uuid.uuid4()}"}}
-    return _invoke_graph(graph, inputs, config=config, debug=debug)
+
+    with sqlite_checkpointer(checkpoint_db_path) as checkpointer:
+        graph = build_graph(checkpointer=checkpointer)
+        return _invoke_graph(graph, inputs, config=config, debug=debug)
 
 
-def chat(thread_id: str = "default", debug: bool = False) -> None:
+def chat(
+    thread_id: str = "default",
+    debug: bool = False,
+    checkpoint_db_path: str | Path | None = None,
+) -> None:
     """启动多轮对话；同一个 thread_id 会复用 LangGraph 历史状态。"""
-    graph = build_graph(with_memory=True)
     config = {"configurable": {"thread_id": thread_id}}
 
-    print("进入多轮对话模式。输入 exit、quit 或 q 结束。")
-    print(f"thread_id: {thread_id}")
+    with sqlite_checkpointer(checkpoint_db_path) as checkpointer:
+        graph = build_graph(checkpointer=checkpointer)
+        print("进入多轮对话模式。输入 exit、quit 或 q 结束。")
+        print(f"thread_id: {thread_id}")
+        print(f"checkpoint_db: {resolve_checkpoint_db_path(checkpoint_db_path)}")
 
-    while True:
-        question = input("\n你: ").strip()
-        if question.lower() in {"exit", "quit", "q"}:
-            print("已结束多轮对话。")
-            return
-        if not question:
-            continue
+        while True:
+            question = input("\n你: ").strip()
+            if question.lower() in {"exit", "quit", "q"}:
+                print("已结束多轮对话。")
+                return
+            if not question:
+                continue
 
-        inputs = {"messages": [{"role": "user", "content": question}]}
-        final_message = _invoke_graph(graph, inputs, config=config, debug=debug)
-        if not debug:
-            print(f"\n助手: {final_message.content}")
+            inputs = {"messages": [{"role": "user", "content": question}]}
+            final_message = _invoke_graph(graph, inputs, config=config, debug=debug)
+            if not debug:
+                print(f"\n助手: {final_message.content}")
 
 
 def _invoke_graph(graph, inputs: dict, config: dict | None, debug: bool) -> AIMessage:
