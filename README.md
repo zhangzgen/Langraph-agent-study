@@ -1,6 +1,8 @@
-# LangGraph ReAct Agent Demo
+# LangGraph ReAct Agent Study
 
-这个项目演示如何用 LangGraph 手写一个 ReAct agent。你已经了解 `Node`、`State`、`Edge`，所以重点放在 ReAct 循环：
+这个项目是一个用于学习、实验和持续升级的 LangGraph Agent 项目。它从手写 ReAct agent 起步，逐步沉淀工具系统、Skill 机制、测试体系、记忆能力、权限控制和工程化结构，目标是不断向更接近工业场景的自主智能体架构对齐。
+
+当前阶段重点放在理解 LangGraph 的 `Node`、`State`、`Edge` 和 ReAct 循环，并把学习过程中的能力拆成可维护、可测试、可扩展的模块：
 
 ```text
 START -> llm -> tools? -> llm -> ... -> END
@@ -29,7 +31,8 @@ langraph_agent/
 └── tools/
     ├── basic.py           # calculator、current_time 等基础工具
     ├── shell.py           # bash 工具和命令安全策略
-    └── skill_tools.py     # list_skills、load_skill 工具
+    ├── skill_tools.py     # list_skills、load_skill 工具
+    └── web_search.py      # Tavily web_search、web_extract 联网工具
 ```
 
 后续扩展时建议：
@@ -69,6 +72,7 @@ cp .env.example .env
 XIAOMI_API_KEY=你的真实 AK
 XIAOMI_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
 XIAOMI_MODEL=mimo-v2.5-pro
+TAVILY_API_KEY=你的 Tavily API Key
 ```
 
 ## 运行
@@ -81,6 +85,21 @@ python react_agent.py "北京现在几点？顺便算一下 23 * 47"
 
 ```bash
 uv run python react_agent.py "北京现在几点？顺便算一下 23 * 47"
+```
+
+需要查询互联网实时信息时，配置 `TAVILY_API_KEY` 后可以让模型自动调用联网工具：
+
+- `web_search`: 用关键词搜索，返回搜索摘要和来源链接。这里的 `content` 是搜索结果片段，不是网页全文。
+- `web_extract`: 用户已经给出 URL 时，提取该网页正文内容，适合总结、阅读和分析链接。
+
+```bash
+uv run python react_agent.py --debug "搜索 LangGraph 最新版本变化，并列出来源"
+```
+
+直接分析链接：
+
+```bash
+uv run python react_agent.py --debug "阅读这个链接并总结重点：https://example.com"
 ```
 
 查看每一步图执行过程：
