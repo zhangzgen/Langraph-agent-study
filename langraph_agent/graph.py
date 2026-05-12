@@ -5,13 +5,19 @@ import uuid
 
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import MessagesState, START, StateGraph
-from langgraph.prebuilt import tools_condition
+from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from langraph_agent.llm import build_llm
+from langraph_agent.models import AgentState
 from langraph_agent.skills.registry import discover_skills, format_skill_catalog
-from langraph_agent.tool_guard import guarded_tool_node
+from langraph_agent.tool_guard import (
+    approval_gate_node,
+    classify_tool_calls_node,
+    execute_tools_node,
+    has_pending_approvals,
+    has_tool_calls,
+)
 
 
 def build_graph(with_memory: bool = False):
@@ -19,7 +25,7 @@ def build_graph(with_memory: bool = False):
     llm = build_llm()
     skill_catalog = format_skill_catalog(discover_skills())
 
-    def call_llm(state: MessagesState) -> dict[str, list[BaseMessage]]:
+    def call_llm(state: AgentState) -> dict[str, list[BaseMessage]]:
         """调用模型，让模型决定直接回答还是请求工具调用。"""
         system_message = {
             "role": "system",
@@ -47,27 +53,35 @@ def build_graph(with_memory: bool = False):
         return {"messages": [response]}
 
     # StateGraph 定义“状态如何在节点之间流动”。
-    # 这个示例只手写两个节点：llm 和 tools。
-    builder = StateGraph(MessagesState)
+    # 这里把工具执行拆成三段，方便观察和扩展审批状态。
+    builder = StateGraph(AgentState)
 
     # llm 节点：负责调用模型，让模型判断下一步。
     builder.add_node("llm", call_llm)
-
-    # tools 节点：先按白名单判断工具调用，风险工具通过 interrupt 请求人工审批。
-    # 审批通过后才真正执行工具，并把结果作为 ToolMessage 追加回 messages。
-    builder.add_node("tools", guarded_tool_node)
+    builder.add_node("classify_tool_calls", classify_tool_calls_node)
+    builder.add_node("approval_gate", approval_gate_node)
+    builder.add_node("execute_tools", execute_tools_node)
 
     # 图从 START 进入 llm。
     builder.add_edge(START, "llm")
 
-    # 条件边是 ReAct 循环的核心：
-    # - 如果上一条 AIMessage 有 tool_calls，则路由到 tools。
-    # - 如果没有 tool_calls，则路由到 END，表示模型已经给出最终回答。
-    builder.add_conditional_edges("llm", tools_condition)
+    # 如果上一条 AIMessage 有 tool_calls，就进入工具状态机；否则结束。
+    builder.add_conditional_edges(
+        "llm",
+        _route_after_llm,
+        {"classify_tool_calls": "classify_tool_calls", END: END},
+    )
 
-    # 工具执行完以后回到 llm。
-    # 模型会看到 ToolMessage，再决定继续调用工具还是输出最终答案。
-    builder.add_edge("tools", "llm")
+    # 分类后，有待审核工具就暂停请求人工审批；否则直接执行自动批准的工具。
+    builder.add_conditional_edges(
+        "classify_tool_calls",
+        _route_after_classify,
+        {"approval_gate": "approval_gate", "execute_tools": "execute_tools"},
+    )
+    builder.add_edge("approval_gate", "execute_tools")
+
+    # 工具执行完以后回到 llm。模型会看到 ToolMessage，再决定继续调用工具还是输出最终答案。
+    builder.add_edge("execute_tools", "llm")
 
     if not with_memory:
         return builder.compile()
@@ -77,6 +91,16 @@ def build_graph(with_memory: bool = False):
     # LangGraph 会从 checkpointer 取出旧 State，再把新消息追加进去。
     checkpointer = MemorySaver()
     return builder.compile(checkpointer=checkpointer)
+
+
+def _route_after_llm(state: AgentState) -> str:
+    """根据最后一条 AIMessage 是否包含 tool_calls 决定是否进入工具状态机。"""
+    return "classify_tool_calls" if has_tool_calls(state) else END
+
+
+def _route_after_classify(state: AgentState) -> str:
+    """根据分类结果决定先人工审批还是直接执行工具。"""
+    return "approval_gate" if has_pending_approvals(state) else "execute_tools"
 
 
 def run(question: str, debug: bool = False) -> AIMessage:
@@ -152,25 +176,40 @@ def _invoke_graph(graph, inputs: dict, config: dict | None, debug: bool) -> AIMe
     return final_message
 
 
-def _prompt_for_interrupt_resume(interrupts) -> dict[str, bool]:
+def _prompt_for_interrupt_resume(interrupts) -> dict[str, bool] | dict[str, list[str]]:
     """在 CLI 中展示 interrupt 审批请求，并返回 Command(resume=...) 所需数据。"""
+    tool_call_ids = []
     for interrupt_item in interrupts:
         value = getattr(interrupt_item, "value", interrupt_item)
-        _print_tool_approval_request(value)
+        tool_call_ids.extend(
+            _print_tool_approval_request(
+                value,
+                start_index=len(tool_call_ids) + 1,
+            )
+        )
 
     try:
-        answer = input("是否批准执行以上工具调用？输入 y 或 yes 批准: ").strip().lower()
+        answer = input(
+            "批准哪些工具调用？输入 a/yes 全部批准，r/no 全部拒绝，或编号如 1,3: "
+        ).strip().lower()
     except (EOFError, OSError):
         answer = ""
-    return {"approved": answer in {"y", "yes"}}
+
+    if answer in {"a", "all", "y", "yes"}:
+        return {"approved": True}
+    if answer in {"r", "reject", "n", "no", ""}:
+        return {"approved": False}
+
+    approved_call_ids = _parse_approved_indices(answer, tool_call_ids)
+    return {"approved_call_ids": approved_call_ids}
 
 
-def _print_tool_approval_request(value) -> None:
-    """格式化打印 tool_guard 传出的结构化审批请求。"""
+def _print_tool_approval_request(value, start_index: int = 1) -> list[str]:
+    """格式化打印 tool_guard 传出的结构化审批请求，并返回展示顺序中的 call id。"""
     print("\n[tool approval] 需要人工审核")
     if not isinstance(value, dict):
         print(value)
-        return
+        return []
 
     message = value.get("message")
     if message:
@@ -178,15 +217,34 @@ def _print_tool_approval_request(value) -> None:
     tool_calls = value.get("tool_calls")
     if not isinstance(tool_calls, list):
         print(json.dumps(value, ensure_ascii=False, indent=2))
-        return
+        return []
 
-    for index, tool_call in enumerate(tool_calls, start=1):
-        print(f"\n{index}. {tool_call.get('name')} id={tool_call.get('id')}")
+    tool_call_ids = []
+    for offset, tool_call in enumerate(tool_calls):
+        index = start_index + offset
+        tool_call_id = tool_call.get("id")
+        if isinstance(tool_call_id, str):
+            tool_call_ids.append(tool_call_id)
+        print(f"\n{index}. {tool_call.get('name')} id={tool_call_id}")
         reason = tool_call.get("reason")
         if reason:
             print(f"reason: {reason}")
         print("args:")
         print(json.dumps(tool_call.get("args") or {}, ensure_ascii=False, indent=2))
+    return tool_call_ids
+
+
+def _parse_approved_indices(answer: str, tool_call_ids: list[str]) -> list[str]:
+    """把用户输入的编号列表转换为 tool_call id 列表。"""
+    approved = []
+    for raw_part in answer.replace("，", ",").split(","):
+        part = raw_part.strip()
+        if not part.isdigit():
+            continue
+        index = int(part)
+        if 1 <= index <= len(tool_call_ids):
+            approved.append(tool_call_ids[index - 1])
+    return approved
 
 
 def _format_message(message: BaseMessage) -> str:

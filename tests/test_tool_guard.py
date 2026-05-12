@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import MessagesState, START, StateGraph
+from langgraph.graph import START, StateGraph
 from langgraph.types import Command
 
 from langraph_agent import tool_guard
+from langraph_agent.models import AgentState
 from langraph_agent.tools import FILESYSTEM_TOOLS
 from langraph_agent.tools import shell
 
@@ -93,8 +94,8 @@ def test_graph_approved_bash_execution_skips_interactive_confirmation(
     assert "stdout:\nhello" in result
 
 
-def test_guarded_tool_node_interrupts_and_resumes_with_rejection() -> None:
-    def request_write_file(_state: MessagesState) -> dict[str, list[AIMessage]]:
+def test_tool_approval_state_machine_interrupts_and_resumes_with_rejection() -> None:
+    def request_write_file(_state: AgentState) -> dict[str, list[AIMessage]]:
         return {
             "messages": [
                 AIMessage(
@@ -110,11 +111,15 @@ def test_guarded_tool_node_interrupts_and_resumes_with_rejection() -> None:
             ]
         }
 
-    builder = StateGraph(MessagesState)
+    builder = StateGraph(AgentState)
     builder.add_node("llm", request_write_file)
-    builder.add_node("tools", tool_guard.guarded_tool_node)
+    builder.add_node("classify_tool_calls", tool_guard.classify_tool_calls_node)
+    builder.add_node("approval_gate", tool_guard.approval_gate_node)
+    builder.add_node("execute_tools", tool_guard.execute_tools_node)
     builder.add_edge(START, "llm")
-    builder.add_edge("llm", "tools")
+    builder.add_edge("llm", "classify_tool_calls")
+    builder.add_edge("classify_tool_calls", "approval_gate")
+    builder.add_edge("approval_gate", "execute_tools")
     graph = builder.compile(checkpointer=MemorySaver())
     config = {"configurable": {"thread_id": "approval-test"}}
 
@@ -128,3 +133,61 @@ def test_guarded_tool_node_interrupts_and_resumes_with_rejection() -> None:
     resumed = graph.invoke(Command(resume={"approved": False}), config=config)
 
     assert "用户未批准执行工具 write_file" in resumed["messages"][-1].content
+    assert resumed["tool_audit_log"][-1]["status"] == "rejected"
+
+
+def test_tool_approval_state_machine_supports_partial_approval() -> None:
+    def request_two_tools(_state: AgentState) -> dict[str, list[AIMessage]]:
+        return {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call_write",
+                            "name": "write_file",
+                            "args": {"file_path": "tmp.txt", "text": "hello"},
+                        },
+                        {
+                            "id": "call_bash",
+                            "name": "bash",
+                            "args": {"command": "printf approved", "timeout_seconds": 1},
+                        },
+                    ],
+                )
+            ]
+        }
+
+    builder = StateGraph(AgentState)
+    builder.add_node("llm", request_two_tools)
+    builder.add_node("classify_tool_calls", tool_guard.classify_tool_calls_node)
+    builder.add_node("approval_gate", tool_guard.approval_gate_node)
+    builder.add_node("execute_tools", tool_guard.execute_tools_node)
+    builder.add_edge(START, "llm")
+    builder.add_edge("llm", "classify_tool_calls")
+    builder.add_edge("classify_tool_calls", "approval_gate")
+    builder.add_edge("approval_gate", "execute_tools")
+    graph = builder.compile(checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "partial-approval-test"}}
+
+    interrupted = graph.invoke({"messages": []}, config=config)
+    approval_request = interrupted["__interrupt__"][0].value
+
+    assert [item["id"] for item in approval_request["tool_calls"]] == [
+        "call_write",
+        "call_bash",
+    ]
+
+    resumed = graph.invoke(
+        Command(resume={"approved_call_ids": ["call_bash"]}),
+        config=config,
+    )
+
+    tool_messages = resumed["messages"][-2:]
+    assert "stdout:\napproved" in tool_messages[0].content
+    assert "用户未批准执行工具 write_file" in tool_messages[1].content
+    assert [entry["status"] for entry in resumed["tool_audit_log"][-3:]] == [
+        "rejected",
+        "approved",
+        "executed",
+    ]

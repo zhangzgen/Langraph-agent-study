@@ -10,10 +10,10 @@ START -> llm -> tools? -> llm -> ... -> END
 
 其中：
 
-- `State`: 使用 LangGraph 内置的 `MessagesState`，核心字段是 `messages`。
+- `State`: 使用自定义 `AgentState`，核心字段仍是 `messages`，同时显式记录工具审批状态和审计日志。
 - `llm` node: 调用小米 OpenAI 兼容接口，并让模型决定是否调用工具。
-- `tools` node: 使用自定义 guarded tool executor 执行模型请求的工具调用；白名单工具直接执行，高风险工具通过 LangGraph `interrupt()` 请求人工审核。
-- `conditional edge`: 使用 `tools_condition` 检查上一条 AI 消息里是否有 `tool_calls`。有就进入 `tools`，没有就结束。
+- `tool state machine`: 将工具流程拆成 `classify_tool_calls`、`approval_gate`、`execute_tools` 三个节点。
+- `conditional edge`: 检查上一条 AI 消息里是否有 `tool_calls`。有就进入工具状态机，没有就结束。
 
 ## 项目结构
 
@@ -110,7 +110,7 @@ uv run python react_agent.py --debug "阅读这个链接并总结重点：https:
 - 需要人工审核：`write_file`、`copy_file`、`move_file`、`file_delete`、`bash`。
 - 敏感路径如 `.env`、`.git/`、`.venv/` 即使通过只读工具访问，也会升级为人工审核。
 
-遇到需要审核的工具调用时，CLI 会暂停并显示工具名、参数和原因。输入 `y` 或 `yes` 批准，其他输入视为拒绝。
+遇到需要审核的工具调用时，CLI 会暂停并显示工具名、参数和原因。输入 `a` 或 `yes` 批准全部，输入 `r` 或 `no` 拒绝全部，也可以输入 `1,3` 只批准指定编号。
 
 查看每一步图执行过程：
 
@@ -183,23 +183,28 @@ uv run pytest
 核心图结构在 `langraph_agent/graph.py` 的 `build_graph()`：
 
 ```python
-builder = StateGraph(MessagesState)
+builder = StateGraph(AgentState)
 builder.add_node("llm", call_llm)
-builder.add_node("tools", guarded_tool_node)
+builder.add_node("classify_tool_calls", classify_tool_calls_node)
+builder.add_node("approval_gate", approval_gate_node)
+builder.add_node("execute_tools", execute_tools_node)
 builder.add_edge(START, "llm")
-builder.add_conditional_edges("llm", tools_condition)
-builder.add_edge("tools", "llm")
+builder.add_conditional_edges("llm", _route_after_llm)
+builder.add_conditional_edges("classify_tool_calls", _route_after_classify)
+builder.add_edge("approval_gate", "execute_tools")
+builder.add_edge("execute_tools", "llm")
 graph = builder.compile()
 ```
 
 ReAct 的关键点不是某个神秘框架 API，而是：
 
 1. 模型先推理并决定是否需要工具。
-2. 如果返回 `tool_calls`，条件边把状态路由到 `tools` node。
-3. `guarded_tool_node` 先判断工具白名单；高风险工具通过 `interrupt()` 暂停并请求人工审核。
-4. 审核通过或自动通过的工具会被执行，结果追加为 `ToolMessage`。
-5. 图回到 `llm` node，模型读取工具结果后继续推理。
-6. 当模型不再返回 `tool_calls`，条件边路由到 `END`。
+2. 如果返回 `tool_calls`，条件边把状态路由到 `classify_tool_calls`。
+3. `classify_tool_calls` 把调用分为自动批准和待人工审核，并写入 `pending_approvals`、`approved_tool_calls` 和 `tool_audit_log`。
+4. 如果存在 `pending_approvals`，`approval_gate` 通过 `interrupt()` 暂停并等待用户逐项批准或拒绝。
+5. `execute_tools` 执行已批准的工具，并为被拒绝的工具调用生成 `ToolMessage`。
+6. 图回到 `llm` node，模型读取工具结果后继续推理。
+7. 当模型不再返回 `tool_calls`，条件边路由到 `END`。
 
 ## 多轮对话
 

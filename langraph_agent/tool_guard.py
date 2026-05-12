@@ -6,10 +6,10 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import BaseTool
-from langgraph.graph import MessagesState
 from langgraph.types import interrupt
 
 from langraph_agent.config import OUTPUT_LIMIT
+from langraph_agent.models import AgentState, ApprovalStatus, ToolApproval
 from langraph_agent.tools import TOOLS
 
 # 这些工具默认允许直接执行。注意“工具名白名单”不是唯一条件：
@@ -53,38 +53,95 @@ SENSITIVE_PATH_SUFFIXES = (
 TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
 
 
-def guarded_tool_node(state: MessagesState) -> dict[str, list[ToolMessage]]:
-    """执行模型请求的工具调用，并在高风险工具执行前请求人工审核。"""
+def classify_tool_calls_node(
+    state: AgentState,
+) -> dict[str, list[dict[str, Any]] | list[ToolApproval]]:
+    """将模型请求的工具调用分成自动执行和等待人工审核两类。"""
     tool_calls = _get_last_tool_calls(state)
     if not tool_calls:
-        return {"messages": []}
+        return {
+            "pending_approvals": [],
+            "approved_tool_calls": [],
+            "rejected_tool_calls": [],
+        }
 
     approved_calls = []
     review_required_calls = []
+    audit_entries = []
     for tool_call in tool_calls:
         if should_auto_approve_tool_call(tool_call):
             approved_calls.append(tool_call)
+            audit_entries.append(_approval_entry(tool_call, "auto_approved", None))
         else:
             review_required_calls.append(tool_call)
+            audit_entries.append(
+                _approval_entry(tool_call, "review_required", _review_reason(tool_call))
+            )
 
+    return {
+        "pending_approvals": [
+            _approval_entry(tool_call, "review_required", _review_reason(tool_call))
+            for tool_call in review_required_calls
+        ],
+        "approved_tool_calls": approved_calls,
+        "rejected_tool_calls": [],
+        "tool_audit_log": _append_audit_log(state, audit_entries),
+    }
+
+
+def approval_gate_node(
+    state: AgentState,
+) -> dict[str, list[dict[str, Any]] | list[ToolApproval]]:
+    """对 pending_approvals 执行细粒度人工审批，并更新批准/拒绝列表。"""
+    pending_approvals = state.get("pending_approvals", [])
+    if not pending_approvals:
+        return {}
+
+    review_required_calls = [_tool_call_from_approval(item) for item in pending_approvals]
+    # interrupt 会把图暂停在当前节点。CLI 收到 __interrupt__ 后展示审批信息，
+    # 再用 Command(resume=...) 把人类决策传回这里，继续从这一行往下执行。
+    decision = interrupt(build_tool_approval_request(review_required_calls))
+    approved_call_ids = normalize_approved_call_ids(decision, review_required_calls)
+
+    approved_calls = list(state.get("approved_tool_calls", []))
     rejected_calls = []
-    if review_required_calls:
-        # interrupt 会把图暂停在当前节点。CLI 收到 __interrupt__ 后展示审批信息，
-        # 再用 Command(resume=...) 把人类决策传回这里，继续从这一行往下执行。
-        decision = interrupt(build_tool_approval_request(review_required_calls))
-        approved_call_ids = normalize_approved_call_ids(decision, review_required_calls)
-        for tool_call in review_required_calls:
-            if tool_call.get("id") in approved_call_ids:
-                approved_calls.append(tool_call)
-            else:
-                rejected_calls.append(tool_call)
+    audit_entries = []
+    for tool_call in review_required_calls:
+        if tool_call.get("id") in approved_call_ids:
+            approved_calls.append(tool_call)
+            audit_entries.append(_approval_entry(tool_call, "approved", "用户批准执行。"))
+        else:
+            rejected_calls.append(tool_call)
+            audit_entries.append(_approval_entry(tool_call, "rejected", "用户拒绝执行。"))
 
-    messages = [
-        _execute_tool_call(tool_call)
-        for tool_call in approved_calls
-    ]
-    messages.extend(_rejected_tool_message(tool_call) for tool_call in rejected_calls)
-    return {"messages": messages}
+    return {
+        "pending_approvals": [],
+        "approved_tool_calls": approved_calls,
+        "rejected_tool_calls": rejected_calls,
+        "tool_audit_log": _append_audit_log(state, audit_entries),
+    }
+
+
+def execute_tools_node(state: AgentState) -> dict[str, list[ToolMessage] | list[ToolApproval]]:
+    """执行已批准的工具调用，并为被拒绝的调用生成 ToolMessage。"""
+    messages = []
+    audit_entries = []
+    for tool_call in state.get("approved_tool_calls", []):
+        message = _execute_tool_call(tool_call)
+        messages.append(message)
+        status = "failed" if message.content.startswith("工具执行失败:") else "executed"
+        audit_entries.append(_approval_entry(tool_call, status, None))
+
+    for tool_call in state.get("rejected_tool_calls", []):
+        messages.append(_rejected_tool_message(tool_call))
+
+    return {
+        "messages": messages,
+        "pending_approvals": [],
+        "approved_tool_calls": [],
+        "rejected_tool_calls": [],
+        "tool_audit_log": _append_audit_log(state, audit_entries),
+    }
 
 
 def should_auto_approve_tool_call(tool_call: dict[str, Any]) -> bool:
@@ -144,7 +201,17 @@ def normalize_approved_call_ids(
     return set()
 
 
-def _get_last_tool_calls(state: MessagesState) -> list[dict[str, Any]]:
+def has_tool_calls(state: AgentState) -> bool:
+    """判断当前状态最后一条 AIMessage 是否包含 tool_calls。"""
+    return bool(_get_last_tool_calls(state))
+
+
+def has_pending_approvals(state: AgentState) -> bool:
+    """判断当前状态中是否存在待人工审核的工具调用。"""
+    return bool(state.get("pending_approvals"))
+
+
+def _get_last_tool_calls(state: AgentState) -> list[dict[str, Any]]:
     """从状态最后一条 AIMessage 中取出模型请求的 tool_calls。"""
     messages = state["messages"]
     if not messages:
@@ -207,6 +274,41 @@ def _rejected_tool_message(tool_call: dict[str, Any]) -> ToolMessage:
         tool_call_id=tool_call_id,
         name=tool_name,
     )
+
+
+def _approval_entry(
+    tool_call: dict[str, Any],
+    status: ApprovalStatus,
+    reason: str | None,
+) -> ToolApproval:
+    """把 LangChain tool_call 转成可持久记录的审批事件。"""
+    tool_name = tool_call.get("name") or ""
+    return {
+        "tool_call_id": tool_call.get("id") or tool_name,
+        "tool_name": tool_name,
+        "args": tool_call.get("args") or {},
+        "status": status,
+        "reason": reason,
+    }
+
+
+def _tool_call_from_approval(approval: ToolApproval) -> dict[str, Any]:
+    """把审批状态对象还原为执行器使用的 tool_call 结构。"""
+    return {
+        "id": approval["tool_call_id"],
+        "name": approval["tool_name"],
+        "args": approval["args"],
+    }
+
+
+def _append_audit_log(
+    state: AgentState,
+    entries: list[ToolApproval],
+) -> list[ToolApproval]:
+    """在普通 list state 字段上显式追加审计事件。"""
+    if not entries:
+        return state.get("tool_audit_log", [])
+    return [*state.get("tool_audit_log", []), *entries]
 
 
 def _has_sensitive_path_argument(args: dict[str, Any]) -> bool:
