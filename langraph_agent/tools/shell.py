@@ -2,12 +2,27 @@ from __future__ import annotations
 
 import re
 import shlex
+from contextlib import contextmanager
+from contextvars import ContextVar
 import subprocess
 from pathlib import Path
 
 from langchain_core.tools import tool
 
 from langraph_agent.config import COMMAND_TIMEOUT_SECONDS, OUTPUT_LIMIT, PROJECT_ROOT
+
+
+_GRAPH_APPROVED_EXECUTION = ContextVar("graph_approved_execution", default=False)
+
+
+@contextmanager
+def graph_approved_execution():
+    """标记当前 bash 调用已经通过 LangGraph 人工审批。"""
+    token = _GRAPH_APPROVED_EXECUTION.set(True)
+    try:
+        yield
+    finally:
+        _GRAPH_APPROVED_EXECUTION.reset(token)
 
 
 # 危险名单：匹配到这些模式时直接拒绝执行。
@@ -75,10 +90,11 @@ DIRECT_ALLOWLIST_PREFIXES = (
 
 @tool
 def bash(command: str, timeout_seconds: int = COMMAND_TIMEOUT_SECONDS) -> str:
-    """执行 bash 命令。白名单命令直接执行，非白名单命令需要用户确认，危险命令会被拦截。"""
-    # 这是一个高权限工具，故意把安全策略放在工具内部，而不是完全依赖模型自觉。
-    # Skill 脚本也通过这个工具执行，例如：
-    # bash("uv run python skills/python-debug-helper/scripts/environment_report.py")
+    """执行 bash 命令。白名单命令直接执行，非白名单命令需要用户确认，危险命令会被拦截。
+
+    这是高权限工具，安全策略放在工具内部作为第二层保护。Skill 脚本也通过
+    这个工具执行，例如 bash("uv run python skills/python-debug-helper/scripts/environment_report.py")。
+    """
     command = command.strip()
     if not command:
         return "命令为空，未执行。"
@@ -86,7 +102,7 @@ def bash(command: str, timeout_seconds: int = COMMAND_TIMEOUT_SECONDS) -> str:
     if _is_dangerous_command(command):
         return f"已拦截危险命令，未执行: {command}"
 
-    if not _is_directly_allowed_command(command):
+    if not _is_directly_allowed_command(command) and not _GRAPH_APPROVED_EXECUTION.get():
         if not _confirm_execution("bash", command):
             return f"用户未确认，命令未执行: {command}"
 
@@ -94,8 +110,7 @@ def bash(command: str, timeout_seconds: int = COMMAND_TIMEOUT_SECONDS) -> str:
 
 
 def _is_dangerous_command(command: str) -> bool:
-    # 对整条命令做正则匹配，覆盖明显破坏性操作。
-    # 这一步优先于白名单判断，避免 `find . -delete` 这类命令被 find 白名单放过。
+    """判断命令是否命中明显破坏性的危险模式。"""
     lowered = command.lower()
     if _is_dangerous_rm_command(command):
         return True
@@ -103,6 +118,7 @@ def _is_dangerous_command(command: str) -> bool:
 
 
 def _is_dangerous_rm_command(command: str) -> bool:
+    """专门识别 rm -rf 这类递归强制删除命令。"""
     try:
         parts = shlex.split(command)
     except ValueError:
@@ -125,8 +141,7 @@ def _is_dangerous_rm_command(command: str) -> bool:
 
 
 def _is_directly_allowed_command(command: str) -> bool:
-    # 白名单只允许“单条简单命令”直接执行。
-    # 只要出现 shell 控制符，就必须走用户确认。
+    """判断命令是否属于可以跳过确认的简单低风险命令。"""
     if any(operator in command for operator in SHELL_CONTROL_OPERATORS):
         return False
 
@@ -145,8 +160,7 @@ def _is_directly_allowed_command(command: str) -> bool:
 
 
 def _has_disallowed_allowlist_options(parts: list[str]) -> bool:
-    # 某些命令整体看似只读，但特定参数会产生破坏性副作用。
-    # 这些参数会让命令退出白名单，转入用户确认或危险拦截。
+    """识别会让白名单命令产生副作用的危险参数。"""
     if parts[0] == "sed" and "-i" in parts:
         return True
     if parts[0] == "find" and any(part in {"-delete", "-exec", "-execdir"} for part in parts):
@@ -159,8 +173,7 @@ def _has_disallowed_allowlist_options(parts: list[str]) -> bool:
 
 
 def _confirm_execution(tool_name: str, command: str) -> bool:
-    # 非白名单命令需要人类在终端显式输入 y/yes。
-    # 如果运行环境没有 stdin，EOFError 会被视为拒绝执行。
+    """在终端请求用户确认非白名单命令。"""
     print(f"\n[{tool_name}] 即将执行需要确认的命令:")
     print(command)
     try:
@@ -171,7 +184,7 @@ def _confirm_execution(tool_name: str, command: str) -> bool:
 
 
 def _run_shell_command(command: str, timeout_seconds: int) -> str:
-    # 统一在项目根目录执行，便于命令使用相对路径。
+    """在项目根目录运行 bash 命令。"""
     return _run_process(
         ["bash", "-lc", command],
         cwd=PROJECT_ROOT,
@@ -180,7 +193,7 @@ def _run_shell_command(command: str, timeout_seconds: int) -> str:
 
 
 def _run_process(command: list[str], cwd: Path, timeout_seconds: int) -> str:
-    # 所有进程执行都收敛到这里，统一处理 timeout、stdout/stderr 和输出截断。
+    """执行子进程并统一处理 timeout、stdout/stderr 和输出截断。"""
     try:
         completed = subprocess.run(
             command,
@@ -208,6 +221,7 @@ def _run_process(command: list[str], cwd: Path, timeout_seconds: int) -> str:
 
 
 def _truncate_output(output: str) -> str:
+    """限制命令输出长度，避免工具结果过大。"""
     if len(output) <= OUTPUT_LIMIT:
         return output
     return output[:OUTPUT_LIMIT] + "\n...[output truncated]"
