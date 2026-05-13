@@ -82,9 +82,14 @@ LANGRAPH_COMPACT_TOKEN_THRESHOLD=8000
 LANGRAPH_RECENT_MESSAGES_TO_KEEP=8
 LANGRAPH_COMMAND_TIMEOUT_SECONDS=30
 LANGRAPH_OUTPUT_LIMIT=8000
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=你的 LangSmith API Key
+LANGSMITH_PROJECT=langraph-agent-dev
 ```
 
 `OPENAI_*` 表示这里使用的是 OpenAI-compatible 协议配置，不绑定具体供应商。所有运行参数统一由 `langraph_agent/config.py` 中的 `config = Config()` 从环境变量加载并设置默认值，业务代码直接使用 `config.xxx`。thinking 开关统一放在 `config.OPENAI_EXTRA_BODY` 中，当前设置为 `{"thinking": {"type": "disabled"}}`，用于兼容 OpenAI-compatible Chat Completions + LangChain 工具调用链路。
+
+LangSmith 当前只开启 tracing。项目启动时会通过 `python-dotenv` 加载 `.env`，只要 `.env` 中 `LANGSMITH_TRACING=true` 且 API Key 有效，LangGraph/LangChain 调用会自动上报 trace。
 
 ## 运行
 
