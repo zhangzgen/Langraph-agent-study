@@ -50,5 +50,14 @@ class Config:
     COMMAND_TIMEOUT_SECONDS = int(os.getenv("LANGRAPH_COMMAND_TIMEOUT_SECONDS", "30"))
     OUTPUT_LIMIT = int(os.getenv("LANGRAPH_OUTPUT_LIMIT", "8000"))
 
+    REACT_PROMPT_ID = os.getenv(
+        "LANGRAPH_REACT_PROMPT_ID",
+        "langraph-agent-react-system",
+    )
+    SUMMARY_PROMPT_ID = os.getenv(
+        "LANGRAPH_SUMMARY_PROMPT_ID",
+        "langraph-agent-summary",
+    )
+
 
 config = Config()

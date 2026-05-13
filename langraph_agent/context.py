@@ -13,6 +13,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from langraph_agent.config import config
 from langraph_agent.models import AgentState
+from langraph_agent.prompt import build_summary_prompt_messages
 
 
 def extract_total_tokens(message: BaseMessage) -> int | None:
@@ -97,7 +98,7 @@ def build_summary_prompt(
     state: AgentState,
     *,
     recent_messages_to_keep: int = config.RECENT_MESSAGES_TO_KEEP,
-) -> list[dict[str, str]]:
+) -> list[BaseMessage]:
     """构造会话压缩摘要提示词。"""
     messages = state.get("messages", [])
     recent_messages = select_recent_messages(messages, recent_messages_to_keep)
@@ -105,25 +106,10 @@ def build_summary_prompt(
     messages_for_summary = messages[:summarize_count]
     existing_summary = state.get("session_summary") or "无"
 
-    return [
-        {
-            "role": "system",
-            "content": (
-                "你负责压缩 LangGraph Agent 的长期对话状态。"
-                "请把旧消息合并进会话摘要，保留事实、决策、约束、文件路径、"
-                "工具结果、用户偏好和未完成事项。不要编造信息。"
-                "输出中文，使用简洁条目。"
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"已有会话摘要:\n{existing_summary}\n\n"
-                f"需要压缩的旧消息:\n{messages_to_text(messages_for_summary)}\n\n"
-                "请输出更新后的会话摘要。"
-            ),
-        },
-    ]
+    return build_summary_prompt_messages(
+        existing_summary=existing_summary,
+        messages_for_summary=messages_to_text(messages_for_summary),
+    )
 
 
 def _message_role(message: BaseMessage) -> str:

@@ -20,6 +20,7 @@ from langraph_agent.context import (
 )
 from langraph_agent.llm import build_llm
 from langraph_agent.models import AgentState
+from langraph_agent.prompt import build_react_prompt_messages
 from langraph_agent.skills.registry import discover_skills, format_skill_catalog
 from langraph_agent.tool_guard import (
     approval_gate_node,
@@ -43,30 +44,13 @@ def build_graph(
 
     def call_llm(state: AgentState) -> dict[str, object]:
         """调用模型，让模型决定直接回答还是请求工具调用。"""
-        system_content = (
-            "你是一个会使用工具的 ReAct agent。"
-            "需要实时信息或计算时先调用工具，拿到工具结果后再给最终回答。"
-            "\n\n你还具备动态 Skill 能力。启动时你只会看到每个 Skill 的 YAML 元数据。"
-            "如果用户请求匹配某个 Skill 的 description，必须先调用 load_skill(skill_name) "
-            "读取完整技能说明，再按照该 Skill 回答。"
-            "如果不确定有哪些 Skill，可以调用 list_skills。"
-            "Skill 是行为说明，不替代工具；需要计算或实时信息时仍然继续调用工具。"
-            "\n\n你还可以使用 bash 执行本地命令和 Skill 自带脚本。"
-            "执行 Skill 脚本时，先通过 load_skill 读取脚本说明，再用 bash 运行 scripts/ 下的脚本。"
-            "不要尝试绕过确认；如果命令被拦截，需要向用户解释原因。"
-            "\n\n你还可以使用文件工具查看或修改当前项目文件。"
-            "read_file、list_directory、file_search 等只读工具通常会自动执行；"
-            "write_file、copy_file、move_file、file_delete、bash 等高风险工具会先请求人工审核。"
-            "当用户只要求查看、解释或搜索项目内容时，优先使用只读文件工具。"
-            f"\n\n当前可用 Skill 元数据:\n{skill_catalog}"
+        prompt_messages = build_react_prompt_messages(
+            skill_catalog=skill_catalog,
+            session_summary=state.get("session_summary"),
         )
-        if state.get("session_summary"):
-            system_content += f"\n\n当前会话摘要:\n{state['session_summary']}"
-
-        system_message = {"role": "system", "content": system_content}
         # 这里是 ReAct 中的“Reason/Act 决策”阶段：
         # 模型读取用户问题和历史消息，决定直接回答，还是返回 tool_calls。
-        response = llm.invoke([system_message, *state["messages"]])
+        response = llm.invoke([*prompt_messages, *state["messages"]])
         update: dict[str, object] = {"messages": [response]}
         total_tokens = extract_total_tokens(response)
         if total_tokens is not None:
