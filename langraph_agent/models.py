@@ -28,6 +28,9 @@ class ToolApproval(TypedDict):
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    session_summary: NotRequired[str]
+    last_total_tokens: NotRequired[int]
+    context_compaction: NotRequired[dict[str, Any]]
     pending_approvals: NotRequired[list[ToolApproval]]
     approved_tool_calls: NotRequired[list[dict[str, Any]]]
     rejected_tool_calls: NotRequired[list[dict[str, Any]]]

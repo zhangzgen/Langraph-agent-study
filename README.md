@@ -76,6 +76,8 @@ XIAOMI_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
 XIAOMI_MODEL=mimo-v2.5-pro
 TAVILY_API_KEY=你的 Tavily API Key
 LANGRAPH_CHECKPOINT_DB_PATH=data/checkpoints.sqlite
+LANGRAPH_COMPACT_TOKEN_THRESHOLD=8000
+LANGRAPH_RECENT_MESSAGES_TO_KEEP=8
 ```
 
 ## 运行
@@ -242,6 +244,24 @@ graph.invoke(
 这样你每一轮只需要传“新增的用户消息”。LangGraph 会根据 `thread_id` 取回上一轮保存的 State，再把新消息追加进去。
 
 SQLite checkpoint 会跨进程保留同一个 `thread_id` 的历史。`build_graph(with_memory=True)` 仍保留 `MemorySaver` 路径，主要用于测试或临时内存实验；CLI 的 `run` 和 `chat` 路径默认使用 SQLite。
+
+## 状态压缩
+
+模型响应会返回 `usage_metadata.total_tokens`。项目会记录最近一次模型调用的真实 `total_tokens` 到 `last_total_tokens`，当最终回答后的 token 数超过 `LANGRAPH_COMPACT_TOKEN_THRESHOLD` 时，图会进入 `summarize_and_compact` 节点：
+
+1. 用不绑定工具的 LLM 把旧消息合并进 `session_summary`。
+2. 保留最近 `LANGRAPH_RECENT_MESSAGES_TO_KEEP` 条消息，并避免从孤立的 `ToolMessage` 开始。
+3. 通过 `RemoveMessage(id=REMOVE_ALL_MESSAGES)` 物理裁剪 `messages` 状态。
+4. 后续调用 LLM 时，会把 `session_summary` 注入 system prompt。
+
+压缩只会发生在没有 `tool_calls` 的最终 AIMessage 之后，避免破坏 `AIMessage(tool_calls=...)` 和后续 `ToolMessage` 的配对关系。
+
+默认配置：
+
+```bash
+LANGRAPH_COMPACT_TOKEN_THRESHOLD=8000
+LANGRAPH_RECENT_MESSAGES_TO_KEEP=8
+```
 
 ## 动态 Skill
 

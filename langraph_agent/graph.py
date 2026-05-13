@@ -11,6 +11,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from langraph_agent.checkpoints import resolve_checkpoint_db_path, sqlite_checkpointer
+from langraph_agent.context import (
+    DEFAULT_COMPACT_TOKEN_THRESHOLD,
+    DEFAULT_RECENT_MESSAGES_TO_KEEP,
+    build_compacted_messages,
+    build_summary_prompt,
+    extract_total_tokens,
+    should_compact_context,
+)
 from langraph_agent.llm import build_llm
 from langraph_agent.models import AgentState
 from langraph_agent.skills.registry import discover_skills, format_skill_catalog
@@ -26,37 +34,70 @@ from langraph_agent.tool_guard import (
 def build_graph(
     with_memory: bool = False,
     checkpointer: BaseCheckpointSaver | None = None,
+    compact_token_threshold: int = DEFAULT_COMPACT_TOKEN_THRESHOLD,
+    recent_messages_to_keep: int = DEFAULT_RECENT_MESSAGES_TO_KEEP,
 ):
     """构建 LangGraph ReAct 状态机，并按需启用 checkpointer。"""
     llm = build_llm()
+    summary_llm = build_llm(bind_tools=False)
     skill_catalog = format_skill_catalog(discover_skills())
 
-    def call_llm(state: AgentState) -> dict[str, list[BaseMessage]]:
+    def call_llm(state: AgentState) -> dict[str, object]:
         """调用模型，让模型决定直接回答还是请求工具调用。"""
-        system_message = {
-            "role": "system",
-            "content": (
-                "你是一个会使用工具的 ReAct agent。"
-                "需要实时信息或计算时先调用工具，拿到工具结果后再给最终回答。"
-                "\n\n你还具备动态 Skill 能力。启动时你只会看到每个 Skill 的 YAML 元数据。"
-                "如果用户请求匹配某个 Skill 的 description，必须先调用 load_skill(skill_name) "
-                "读取完整技能说明，再按照该 Skill 回答。"
-                "如果不确定有哪些 Skill，可以调用 list_skills。"
-                "Skill 是行为说明，不替代工具；需要计算或实时信息时仍然继续调用工具。"
-                "\n\n你还可以使用 bash 执行本地命令和 Skill 自带脚本。"
-                "执行 Skill 脚本时，先通过 load_skill 读取脚本说明，再用 bash 运行 scripts/ 下的脚本。"
-                "不要尝试绕过确认；如果命令被拦截，需要向用户解释原因。"
-                "\n\n你还可以使用文件工具查看或修改当前项目文件。"
-                "read_file、list_directory、file_search 等只读工具通常会自动执行；"
-                "write_file、copy_file、move_file、file_delete、bash 等高风险工具会先请求人工审核。"
-                "当用户只要求查看、解释或搜索项目内容时，优先使用只读文件工具。"
-                f"\n\n当前可用 Skill 元数据:\n{skill_catalog}"
-            ),
-        }
+        system_content = (
+            "你是一个会使用工具的 ReAct agent。"
+            "需要实时信息或计算时先调用工具，拿到工具结果后再给最终回答。"
+            "\n\n你还具备动态 Skill 能力。启动时你只会看到每个 Skill 的 YAML 元数据。"
+            "如果用户请求匹配某个 Skill 的 description，必须先调用 load_skill(skill_name) "
+            "读取完整技能说明，再按照该 Skill 回答。"
+            "如果不确定有哪些 Skill，可以调用 list_skills。"
+            "Skill 是行为说明，不替代工具；需要计算或实时信息时仍然继续调用工具。"
+            "\n\n你还可以使用 bash 执行本地命令和 Skill 自带脚本。"
+            "执行 Skill 脚本时，先通过 load_skill 读取脚本说明，再用 bash 运行 scripts/ 下的脚本。"
+            "不要尝试绕过确认；如果命令被拦截，需要向用户解释原因。"
+            "\n\n你还可以使用文件工具查看或修改当前项目文件。"
+            "read_file、list_directory、file_search 等只读工具通常会自动执行；"
+            "write_file、copy_file、move_file、file_delete、bash 等高风险工具会先请求人工审核。"
+            "当用户只要求查看、解释或搜索项目内容时，优先使用只读文件工具。"
+            f"\n\n当前可用 Skill 元数据:\n{skill_catalog}"
+        )
+        if state.get("session_summary"):
+            system_content += f"\n\n当前会话摘要:\n{state['session_summary']}"
+
+        system_message = {"role": "system", "content": system_content}
         # 这里是 ReAct 中的“Reason/Act 决策”阶段：
         # 模型读取用户问题和历史消息，决定直接回答，还是返回 tool_calls。
         response = llm.invoke([system_message, *state["messages"]])
-        return {"messages": [response]}
+        update: dict[str, object] = {"messages": [response]}
+        total_tokens = extract_total_tokens(response)
+        if total_tokens is not None:
+            update["last_total_tokens"] = total_tokens
+        return update
+
+    def summarize_and_compact(state: AgentState) -> dict[str, object]:
+        """把旧消息压缩进摘要，并物理裁剪 messages 状态。"""
+        prompt = build_summary_prompt(
+            state,
+            recent_messages_to_keep=recent_messages_to_keep,
+        )
+        response = summary_llm.invoke(prompt)
+        compacted_messages = build_compacted_messages(
+            state["messages"],
+            recent_messages_to_keep=recent_messages_to_keep,
+        )
+        kept_message_count = len(compacted_messages) - 1
+        previous_message_count = len(state["messages"])
+        return {
+            "session_summary": str(response.content),
+            "messages": compacted_messages,
+            "context_compaction": {
+                "previous_message_count": previous_message_count,
+                "kept_message_count": kept_message_count,
+                "removed_message_count": previous_message_count - kept_message_count,
+                "last_total_tokens": state.get("last_total_tokens"),
+                "token_threshold": compact_token_threshold,
+            },
+        }
 
     # StateGraph 定义“状态如何在节点之间流动”。
     # 这里把工具执行拆成三段，方便观察和扩展审批状态。
@@ -67,6 +108,7 @@ def build_graph(
     builder.add_node("classify_tool_calls", classify_tool_calls_node)
     builder.add_node("approval_gate", approval_gate_node)
     builder.add_node("execute_tools", execute_tools_node)
+    builder.add_node("summarize_and_compact", summarize_and_compact)
 
     # 图从 START 进入 llm。
     builder.add_edge(START, "llm")
@@ -74,8 +116,16 @@ def build_graph(
     # 如果上一条 AIMessage 有 tool_calls，就进入工具状态机；否则结束。
     builder.add_conditional_edges(
         "llm",
-        _route_after_llm,
-        {"classify_tool_calls": "classify_tool_calls", END: END},
+        lambda state: _route_after_llm(
+            state,
+            compact_token_threshold=compact_token_threshold,
+            recent_messages_to_keep=recent_messages_to_keep,
+        ),
+        {
+            "classify_tool_calls": "classify_tool_calls",
+            "summarize_and_compact": "summarize_and_compact",
+            END: END,
+        },
     )
 
     # 分类后，有待审核工具就暂停请求人工审批；否则直接执行自动批准的工具。
@@ -88,6 +138,7 @@ def build_graph(
 
     # 工具执行完以后回到 llm。模型会看到 ToolMessage，再决定继续调用工具还是输出最终答案。
     builder.add_edge("execute_tools", "llm")
+    builder.add_edge("summarize_and_compact", END)
 
     if checkpointer is not None:
         return builder.compile(checkpointer=checkpointer)
@@ -102,9 +153,22 @@ def build_graph(
     return builder.compile(checkpointer=checkpointer)
 
 
-def _route_after_llm(state: AgentState) -> str:
-    """根据最后一条 AIMessage 是否包含 tool_calls 决定是否进入工具状态机。"""
-    return "classify_tool_calls" if has_tool_calls(state) else END
+def _route_after_llm(
+    state: AgentState,
+    *,
+    compact_token_threshold: int,
+    recent_messages_to_keep: int,
+) -> str:
+    """根据模型输出决定进入工具状态机、压缩上下文或结束。"""
+    if has_tool_calls(state):
+        return "classify_tool_calls"
+    if should_compact_context(
+        state,
+        token_threshold=compact_token_threshold,
+        recent_messages_to_keep=recent_messages_to_keep,
+    ):
+        return "summarize_and_compact"
+    return END
 
 
 def _route_after_classify(state: AgentState) -> str:
@@ -184,8 +248,8 @@ def _invoke_graph(graph, inputs: dict, config: dict | None, debug: bool) -> AIMe
 
             for node_name, update in event.items():
                 print(f"\n[{node_name}]")
+                _print_debug_update(update)
                 for message in update.get("messages", []):
-                    print(_format_message(message))
                     if isinstance(message, AIMessage):
                         final_message = message
         if not interrupted:
@@ -194,6 +258,25 @@ def _invoke_graph(graph, inputs: dict, config: dict | None, debug: bool) -> AIMe
     if final_message is None:
         raise RuntimeError("图执行结束，但没有得到 AIMessage。")
     return final_message
+
+
+def _print_debug_update(update: dict) -> None:
+    """打印 debug stream 中一个节点的状态更新。"""
+    for message in update.get("messages", []):
+        print(_format_message(message))
+
+    total_tokens = update.get("last_total_tokens")
+    if total_tokens is not None:
+        print(f"last_total_tokens: {total_tokens}")
+
+    summary = update.get("session_summary")
+    if summary:
+        print(f"session_summary:\n{summary}")
+
+    compaction = update.get("context_compaction")
+    if isinstance(compaction, dict):
+        print("context_compaction:")
+        print(json.dumps(compaction, ensure_ascii=False, indent=2))
 
 
 def _prompt_for_interrupt_resume(interrupts) -> dict[str, bool] | dict[str, list[str]]:
@@ -278,6 +361,10 @@ def _format_message(message: BaseMessage) -> str:
     tool_calls = getattr(message, "tool_calls", None)
     if tool_calls:
         parts.append(f"tool_calls={tool_calls}")
+
+    total_tokens = extract_total_tokens(message)
+    if total_tokens is not None:
+        parts.append(f"total_tokens={total_tokens}")
 
     if message.content:
         parts.append(f"content:\n{message.content}")
