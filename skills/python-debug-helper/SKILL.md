@@ -28,7 +28,7 @@ Follow this sequence:
 Missing environment variable:
 
 ```text
-RuntimeError: 缺少 XIAOMI_API_KEY
+RuntimeError: 缺少 OPENAI_API_KEY
 ```
 
 Explain that the program did not load `.env` or the variable is absent.

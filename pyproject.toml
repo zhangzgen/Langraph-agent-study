@@ -1,7 +1,7 @@
 [project]
 name = "langraph-agent"
 version = "0.1.0"
-description = "A minimal LangGraph ReAct agent demo using an OpenAI-compatible Xiaomi model endpoint."
+description = "A minimal LangGraph ReAct agent demo using an OpenAI-compatible model endpoint."
 requires-python = ">=3.11"
 dependencies = [
     "langgraph>=1.0.0",

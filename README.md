@@ -11,7 +11,7 @@ START -> llm -> tools? -> llm -> ... -> END
 其中：
 
 - `State`: 使用自定义 `AgentState`，核心字段仍是 `messages`，同时显式记录工具审批状态和审计日志。
-- `llm` node: 调用小米 OpenAI 兼容接口，并让模型决定是否调用工具。
+- `llm` node: 调用 OpenAI-compatible 接口，并让模型决定是否调用工具。
 - `tool state machine`: 将工具流程拆成 `classify_tool_calls`、`approval_gate`、`execute_tools` 三个节点。
 - `conditional edge`: 检查上一条 AI 消息里是否有 `tool_calls`。有就进入工具状态机，没有就结束。
 
@@ -24,7 +24,7 @@ langraph_agent/
 ├── cli.py                 # 命令行参数、.env 加载、入口调度
 ├── config.py              # 默认模型、项目路径、超时和输出限制等配置
 ├── graph.py               # LangGraph ReAct 图、多轮对话、debug 输出
-├── llm.py                 # ChatOpenAI / 小米兼容接口初始化
+├── llm.py                 # ChatOpenAI / OpenAI-compatible 接口初始化
 ├── models.py              # 项目内共享数据结构
 ├── tool_guard.py          # 工具白名单、人工审核和执行器
 ├── skills/
@@ -71,14 +71,16 @@ cp .env.example .env
 然后编辑 `.env`：
 
 ```bash
-XIAOMI_API_KEY=你的真实 AK
-XIAOMI_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
-XIAOMI_MODEL=mimo-v2.5-pro
+OPENAI_API_KEY=你的真实 AK
+OPENAI_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
+OPENAI_MODEL=mimo-v2.5-pro
 TAVILY_API_KEY=你的 Tavily API Key
 LANGRAPH_CHECKPOINT_DB_PATH=data/checkpoints.sqlite
 LANGRAPH_COMPACT_TOKEN_THRESHOLD=8000
 LANGRAPH_RECENT_MESSAGES_TO_KEEP=8
 ```
+
+`OPENAI_*` 表示这里使用的是 OpenAI-compatible 协议配置，不绑定具体供应商。thinking 开关统一放在 `langraph_agent/config.py` 的 `OPENAI_EXTRA_BODY` 中，当前设置为 `{"thinking": {"type": "disabled"}}`，用于兼容 OpenAI-compatible Chat Completions + LangChain 工具调用链路。
 
 ## 运行
 

@@ -20,7 +20,7 @@ def test_cli_list_skills_prints_catalog_without_api_key(
         encoding="utf-8",
     )
     monkeypatch.setenv("AGENT_SKILLS_DIR", str(tmp_path))
-    monkeypatch.delenv("XIAOMI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(sys, "argv", ["react-agent", "--list-skills"])
 
     cli.main()
