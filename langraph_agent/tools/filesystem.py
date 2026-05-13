@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from langchain_community.agent_toolkits import FileManagementToolkit
 
-from langraph_agent.config import PROJECT_ROOT
+from langraph_agent.config import config
 
 
 # FileManagementToolkit 是 LangChain 提供的现成文件工具集合。
@@ -10,7 +10,7 @@ from langraph_agent.config import PROJECT_ROOT
 # 写入/删除/移动等风险操作不会在这里拦截，而是统一交给 tool_guard 的
 # LangGraph interrupt 审批节点处理。
 FILESYSTEM_TOOLS = FileManagementToolkit(
-    root_dir=str(PROJECT_ROOT),
+    root_dir=str(config.PROJECT_ROOT),
     selected_tools=[
         "copy_file",
         "file_delete",

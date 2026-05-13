@@ -4,6 +4,7 @@ import importlib
 
 import pytest
 
+from langraph_agent.config import config
 from langraph_agent.tools import BASE_TOOLS
 
 
@@ -14,7 +15,7 @@ def test_web_search_is_registered() -> None:
 
 def test_web_search_reports_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     web_search_module = importlib.import_module("langraph_agent.tools.web_search")
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setattr(config, "TAVILY_API_KEY", "")
 
     result = web_search_module.web_search.invoke({"query": "LangGraph latest release"})
 
@@ -23,7 +24,7 @@ def test_web_search_reports_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_web_extract_reports_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     web_search_module = importlib.import_module("langraph_agent.tools.web_search")
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setattr(config, "TAVILY_API_KEY", "")
 
     result = web_search_module.web_extract.invoke({"url": "https://example.com"})
 
@@ -32,11 +33,12 @@ def test_web_extract_reports_missing_api_key(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_web_search_formats_tavily_results(monkeypatch: pytest.MonkeyPatch) -> None:
     web_search_module = importlib.import_module("langraph_agent.tools.web_search")
-    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr(config, "TAVILY_API_KEY", "test-key")
 
     class FakeTavilySearch:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            assert kwargs["tavily_api_key"] == "test-key"
 
         def invoke(self, payload: dict[str, str]) -> dict:
             assert payload == {"query": "LangGraph latest release"}
@@ -66,11 +68,12 @@ def test_web_search_formats_tavily_results(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_web_extract_formats_extracted_content(monkeypatch: pytest.MonkeyPatch) -> None:
     web_search_module = importlib.import_module("langraph_agent.tools.web_search")
-    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr(config, "TAVILY_API_KEY", "test-key")
 
     class FakeTavilyExtract:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            assert kwargs["tavily_api_key"] == "test-key"
 
         def invoke(self, payload: dict) -> dict:
             assert payload == {"urls": ["https://example.com/langgraph"]}

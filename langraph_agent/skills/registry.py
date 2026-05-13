@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import yaml
 
-from langraph_agent.config import DEFAULT_SKILLS_DIR
+from langraph_agent.config import config
 from langraph_agent.models import SkillMetadata
 
 
 def get_skills_dir() -> Path:
     # 可通过 AGENT_SKILLS_DIR 覆盖默认目录，便于后续实验不同 Skill 集合。
-    return Path(os.getenv("AGENT_SKILLS_DIR", DEFAULT_SKILLS_DIR)).expanduser()
+    return config.SKILLS_DIR
 
 
 def discover_skills() -> list[SkillMetadata]:

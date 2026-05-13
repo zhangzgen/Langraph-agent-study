@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Literal
 
 from langchain_core.tools import tool
 from langchain_tavily import TavilyExtract, TavilySearch
+
+from langraph_agent.config import config
 
 
 @tool
@@ -24,6 +25,7 @@ def web_search(
         search_depth="basic",
         topic=topic,
         include_answer=True,
+        tavily_api_key=config.TAVILY_API_KEY,
         # Tavily Search 返回的 content 是搜索摘要/片段，不是网页全文。
         # 这里保持 False，避免搜索工具输出过长；用户给定 URL 时使用 web_extract。
         include_raw_content=False,
@@ -37,7 +39,7 @@ def web_extract(
     url: str,
     extract_depth: Literal["basic", "advanced"] = "basic",
     query: str | None = None,
-    content_limit: int = 12000,
+    content_limit: int = config.TAVILY_EXTRACT_CONTENT_LIMIT,
 ) -> str:
     """提取指定网页 URL 的正文内容；适合用户直接给链接并要求阅读、总结或分析。"""
     if not _has_tavily_api_key():
@@ -47,6 +49,7 @@ def web_extract(
         extract_depth=extract_depth,
         include_images=False,
         format="markdown",
+        tavily_api_key=config.TAVILY_API_KEY,
     )
     payload: dict[str, Any] = {"urls": [url]}
     if query:
@@ -56,7 +59,7 @@ def web_extract(
 
 
 def _has_tavily_api_key() -> bool:
-    return bool(os.getenv("TAVILY_API_KEY"))
+    return bool(config.TAVILY_API_KEY)
 
 
 def _missing_tavily_api_key_message(tool_name: str) -> str:
@@ -94,7 +97,10 @@ def _format_tavily_result(result: Any) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-def _format_tavily_extract_result(result: Any, content_limit: int = 12000) -> str:
+def _format_tavily_extract_result(
+    result: Any,
+    content_limit: int = config.TAVILY_EXTRACT_CONTENT_LIMIT,
+) -> str:
     if not isinstance(result, dict):
         return json.dumps(result, ensure_ascii=False, indent=2)
 

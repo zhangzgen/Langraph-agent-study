@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import argparse
 
-from dotenv import load_dotenv
-
 from langraph_agent.skills.registry import discover_skills, format_skill_catalog
 
 
 def main() -> None:
-    # 加载项目根目录下的 .env，便于长期在本项目环境中使用。
-    load_dotenv()
-
     parser = argparse.ArgumentParser(description="Run a minimal LangGraph ReAct agent.")
     parser.add_argument("question", nargs="?", default="北京现在几点？再计算 23 * 47。")
     parser.add_argument("--chat", action="store_true", help="Start multi-turn chat mode.")

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from langraph_agent import cli
+from langraph_agent.config import config
 
 
 def test_cli_list_skills_prints_catalog_without_api_key(
@@ -19,8 +20,8 @@ def test_cli_list_skills_prints_catalog_without_api_key(
         "---\nname: demo-skill\ndescription: Demo skill\n---\n\n# Demo\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("AGENT_SKILLS_DIR", str(tmp_path))
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(config, "SKILLS_DIR", tmp_path)
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "")
     monkeypatch.setattr(sys, "argv", ["react-agent", "--list-skills"])
 
     cli.main()

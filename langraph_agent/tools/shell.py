@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import re
 import shlex
+import subprocess
 from contextlib import contextmanager
 from contextvars import ContextVar
-import subprocess
 from pathlib import Path
 
 from langchain_core.tools import tool
 
-from langraph_agent.config import COMMAND_TIMEOUT_SECONDS, OUTPUT_LIMIT, PROJECT_ROOT
+from langraph_agent.config import config
 
 
 _GRAPH_APPROVED_EXECUTION = ContextVar("graph_approved_execution", default=False)
@@ -89,7 +89,7 @@ DIRECT_ALLOWLIST_PREFIXES = (
 
 
 @tool
-def bash(command: str, timeout_seconds: int = COMMAND_TIMEOUT_SECONDS) -> str:
+def bash(command: str, timeout_seconds: int = config.COMMAND_TIMEOUT_SECONDS) -> str:
     """执行 bash 命令。白名单命令直接执行，非白名单命令需要用户确认，危险命令会被拦截。
 
     这是高权限工具，安全策略放在工具内部作为第二层保护。Skill 脚本也通过
@@ -187,7 +187,7 @@ def _run_shell_command(command: str, timeout_seconds: int) -> str:
     """在项目根目录运行 bash 命令。"""
     return _run_process(
         ["bash", "-lc", command],
-        cwd=PROJECT_ROOT,
+        cwd=config.PROJECT_ROOT,
         timeout_seconds=timeout_seconds,
     )
 
@@ -222,6 +222,6 @@ def _run_process(command: list[str], cwd: Path, timeout_seconds: int) -> str:
 
 def _truncate_output(output: str) -> str:
     """限制命令输出长度，避免工具结果过大。"""
-    if len(output) <= OUTPUT_LIMIT:
+    if len(output) <= config.OUTPUT_LIMIT:
         return output
-    return output[:OUTPUT_LIMIT] + "\n...[output truncated]"
+    return output[: config.OUTPUT_LIMIT] + "\n...[output truncated]"

@@ -74,13 +74,17 @@ cp .env.example .env
 OPENAI_API_KEY=你的真实 AK
 OPENAI_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
 OPENAI_MODEL=mimo-v2.5-pro
+OPENAI_TEMPERATURE=0
 TAVILY_API_KEY=你的 Tavily API Key
+TAVILY_EXTRACT_CONTENT_LIMIT=12000
 LANGRAPH_CHECKPOINT_DB_PATH=data/checkpoints.sqlite
 LANGRAPH_COMPACT_TOKEN_THRESHOLD=8000
 LANGRAPH_RECENT_MESSAGES_TO_KEEP=8
+LANGRAPH_COMMAND_TIMEOUT_SECONDS=30
+LANGRAPH_OUTPUT_LIMIT=8000
 ```
 
-`OPENAI_*` 表示这里使用的是 OpenAI-compatible 协议配置，不绑定具体供应商。thinking 开关统一放在 `langraph_agent/config.py` 的 `OPENAI_EXTRA_BODY` 中，当前设置为 `{"thinking": {"type": "disabled"}}`，用于兼容 OpenAI-compatible Chat Completions + LangChain 工具调用链路。
+`OPENAI_*` 表示这里使用的是 OpenAI-compatible 协议配置，不绑定具体供应商。所有运行参数统一由 `langraph_agent/config.py` 中的 `config = Config()` 从环境变量加载并设置默认值，业务代码直接使用 `config.xxx`。thinking 开关统一放在 `config.OPENAI_EXTRA_BODY` 中，当前设置为 `{"thinking": {"type": "disabled"}}`，用于兼容 OpenAI-compatible Chat Completions + LangChain 工具调用链路。
 
 ## 运行
 

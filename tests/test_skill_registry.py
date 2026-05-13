@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from langraph_agent.config import config
 from langraph_agent.skills.registry import (
     discover_skills,
     find_skill,
@@ -22,8 +23,11 @@ def write_skill(root: Path, folder: str, frontmatter: str, body: str = "# Body")
     )
 
 
-def test_get_skills_dir_uses_environment_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AGENT_SKILLS_DIR", str(tmp_path))
+def test_get_skills_dir_uses_config_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "SKILLS_DIR", tmp_path)
 
     assert get_skills_dir() == tmp_path
 
@@ -31,7 +35,7 @@ def test_get_skills_dir_uses_environment_override(tmp_path: Path, monkeypatch: p
 def test_discover_skills_reads_valid_frontmatter_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("AGENT_SKILLS_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "SKILLS_DIR", tmp_path)
     write_skill(tmp_path, "alpha", "name: alpha\ndescription: Alpha skill")
     write_skill(tmp_path, "missing-description", "name: broken")
     broken_dir = tmp_path / "broken"
@@ -46,8 +50,11 @@ def test_discover_skills_reads_valid_frontmatter_only(
     assert skills[0].path == tmp_path / "alpha" / "SKILL.md"
 
 
-def test_find_skill_is_case_insensitive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AGENT_SKILLS_DIR", str(tmp_path))
+def test_find_skill_is_case_insensitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "SKILLS_DIR", tmp_path)
     write_skill(tmp_path, "alpha", "name: Alpha\ndescription: Alpha skill")
 
     assert find_skill(" alpha ").name == "Alpha"

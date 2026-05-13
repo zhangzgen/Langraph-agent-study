@@ -1,13 +1,54 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+from dotenv import load_dotenv
 
-OPENAI_DEFAULT_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
-OPENAI_DEFAULT_MODEL = "mimo-v2.5-pro"
-OPENAI_THINKING_TYPE = "disabled"
-OPENAI_EXTRA_BODY = {"thinking": {"type": OPENAI_THINKING_TYPE}}
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SKILLS_DIR = PROJECT_ROOT / "skills"
-COMMAND_TIMEOUT_SECONDS = 30
-OUTPUT_LIMIT = 8000
+
+load_dotenv()
+
+
+class Config:
+    PROJECT_ROOT = Path(
+        os.getenv(
+            "LANGRAPH_PROJECT_ROOT",
+            str(Path(__file__).resolve().parent.parent),
+        )
+    ).expanduser()
+
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_BASE_URL = os.getenv(
+        "OPENAI_BASE_URL",
+        "https://token-plan-cn.xiaomimimo.com/v1",
+    )
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "mimo-v2.5-pro")
+    OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0"))
+    OPENAI_THINKING_TYPE = os.getenv("OPENAI_THINKING_TYPE", "disabled")
+    OPENAI_EXTRA_BODY = {"thinking": {"type": OPENAI_THINKING_TYPE}}
+
+    TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+    TAVILY_EXTRACT_CONTENT_LIMIT = int(
+        os.getenv("TAVILY_EXTRACT_CONTENT_LIMIT", "12000")
+    )
+
+    SKILLS_DIR = Path(
+        os.getenv("AGENT_SKILLS_DIR", str(PROJECT_ROOT / "skills"))
+    ).expanduser()
+
+    CHECKPOINT_DB_PATH = os.getenv(
+        "LANGRAPH_CHECKPOINT_DB_PATH",
+        "data/checkpoints.sqlite",
+    )
+    SQLITE_IN_MEMORY = os.getenv("LANGRAPH_SQLITE_IN_MEMORY", ":memory:")
+
+    COMPACT_TOKEN_THRESHOLD = int(
+        os.getenv("LANGRAPH_COMPACT_TOKEN_THRESHOLD", "8000")
+    )
+    RECENT_MESSAGES_TO_KEEP = int(os.getenv("LANGRAPH_RECENT_MESSAGES_TO_KEEP", "8"))
+
+    COMMAND_TIMEOUT_SECONDS = int(os.getenv("LANGRAPH_COMMAND_TIMEOUT_SECONDS", "30"))
+    OUTPUT_LIMIT = int(os.getenv("LANGRAPH_OUTPUT_LIMIT", "8000"))
+
+
+config = Config()

@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 
-from langraph_agent.config import OUTPUT_LIMIT
+from langraph_agent.config import config
 from langraph_agent.models import AgentState, ApprovalStatus, ToolApproval
 from langraph_agent.tools import TOOLS
 
@@ -260,9 +260,9 @@ def _stringify_tool_result(result: Any) -> str:
             text = json.dumps(result, ensure_ascii=False, indent=2)
         except TypeError:
             text = str(result)
-    if len(text) <= OUTPUT_LIMIT:
+    if len(text) <= config.OUTPUT_LIMIT:
         return text
-    return text[:OUTPUT_LIMIT] + "\n...[tool output truncated]"
+    return text[: config.OUTPUT_LIMIT] + "\n...[tool output truncated]"
 
 
 def _rejected_tool_message(tool_call: dict[str, Any]) -> ToolMessage:

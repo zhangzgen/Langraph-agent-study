@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from langchain_core.messages import (
@@ -12,15 +11,8 @@ from langchain_core.messages import (
 )
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
+from langraph_agent.config import config
 from langraph_agent.models import AgentState
-
-
-DEFAULT_COMPACT_TOKEN_THRESHOLD = int(
-    os.getenv("LANGRAPH_COMPACT_TOKEN_THRESHOLD", "8000")
-)
-DEFAULT_RECENT_MESSAGES_TO_KEEP = int(
-    os.getenv("LANGRAPH_RECENT_MESSAGES_TO_KEEP", "8")
-)
 
 
 def extract_total_tokens(message: BaseMessage) -> int | None:
@@ -43,8 +35,8 @@ def extract_total_tokens(message: BaseMessage) -> int | None:
 def should_compact_context(
     state: AgentState,
     *,
-    token_threshold: int = DEFAULT_COMPACT_TOKEN_THRESHOLD,
-    recent_messages_to_keep: int = DEFAULT_RECENT_MESSAGES_TO_KEEP,
+    token_threshold: int = config.COMPACT_TOKEN_THRESHOLD,
+    recent_messages_to_keep: int = config.RECENT_MESSAGES_TO_KEEP,
 ) -> bool:
     """判断当前对话是否应该在本轮最终回答后压缩。"""
     messages = state.get("messages", [])
@@ -64,7 +56,7 @@ def should_compact_context(
 def build_compacted_messages(
     messages: list[BaseMessage],
     *,
-    recent_messages_to_keep: int = DEFAULT_RECENT_MESSAGES_TO_KEEP,
+    recent_messages_to_keep: int = config.RECENT_MESSAGES_TO_KEEP,
 ) -> list[BaseMessage]:
     """构造用于替换 messages 状态的删除指令和最近消息窗口。"""
     recent_messages = select_recent_messages(messages, recent_messages_to_keep)
@@ -76,7 +68,7 @@ def build_compacted_messages(
 
 def select_recent_messages(
     messages: list[BaseMessage],
-    max_messages: int = DEFAULT_RECENT_MESSAGES_TO_KEEP,
+    max_messages: int = config.RECENT_MESSAGES_TO_KEEP,
 ) -> list[BaseMessage]:
     """选择最近消息，并避免从孤立 ToolMessage 开始。"""
     if len(messages) <= max_messages:
@@ -104,7 +96,7 @@ def messages_to_text(messages: list[BaseMessage]) -> str:
 def build_summary_prompt(
     state: AgentState,
     *,
-    recent_messages_to_keep: int = DEFAULT_RECENT_MESSAGES_TO_KEEP,
+    recent_messages_to_keep: int = config.RECENT_MESSAGES_TO_KEEP,
 ) -> list[dict[str, str]]:
     """构造会话压缩摘要提示词。"""
     messages = state.get("messages", [])

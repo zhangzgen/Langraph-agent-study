@@ -11,9 +11,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from langraph_agent.checkpoints import resolve_checkpoint_db_path, sqlite_checkpointer
+from langraph_agent.config import config
 from langraph_agent.context import (
-    DEFAULT_COMPACT_TOKEN_THRESHOLD,
-    DEFAULT_RECENT_MESSAGES_TO_KEEP,
     build_compacted_messages,
     build_summary_prompt,
     extract_total_tokens,
@@ -34,8 +33,8 @@ from langraph_agent.tool_guard import (
 def build_graph(
     with_memory: bool = False,
     checkpointer: BaseCheckpointSaver | None = None,
-    compact_token_threshold: int = DEFAULT_COMPACT_TOKEN_THRESHOLD,
-    recent_messages_to_keep: int = DEFAULT_RECENT_MESSAGES_TO_KEEP,
+    compact_token_threshold: int = config.COMPACT_TOKEN_THRESHOLD,
+    recent_messages_to_keep: int = config.RECENT_MESSAGES_TO_KEEP,
 ):
     """构建 LangGraph ReAct 状态机，并按需启用 checkpointer。"""
     llm = build_llm()
@@ -185,11 +184,11 @@ def run(
     inputs = {"messages": [{"role": "user", "content": question}]}
     # 单次 run 也启用 checkpointer，因为 interrupt/resume 需要 thread_id
     # 找回暂停时的图状态。
-    config = {"configurable": {"thread_id": f"run-{uuid.uuid4()}"}}
+    graph_config = {"configurable": {"thread_id": f"run-{uuid.uuid4()}"}}
 
     with sqlite_checkpointer(checkpoint_db_path) as checkpointer:
         graph = build_graph(checkpointer=checkpointer)
-        return _invoke_graph(graph, inputs, config=config, debug=debug)
+        return _invoke_graph(graph, inputs, config=graph_config, debug=debug)
 
 
 def chat(
@@ -198,7 +197,7 @@ def chat(
     checkpoint_db_path: str | Path | None = None,
 ) -> None:
     """启动多轮对话；同一个 thread_id 会复用 LangGraph 历史状态。"""
-    config = {"configurable": {"thread_id": thread_id}}
+    graph_config = {"configurable": {"thread_id": thread_id}}
 
     with sqlite_checkpointer(checkpoint_db_path) as checkpointer:
         graph = build_graph(checkpointer=checkpointer)
@@ -215,7 +214,12 @@ def chat(
                 continue
 
             inputs = {"messages": [{"role": "user", "content": question}]}
-            final_message = _invoke_graph(graph, inputs, config=config, debug=debug)
+            final_message = _invoke_graph(
+                graph,
+                inputs,
+                config=graph_config,
+                debug=debug,
+            )
             if not debug:
                 print(f"\n助手: {final_message.content}")
 

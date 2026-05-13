@@ -6,14 +6,15 @@ from pathlib import Path
 import pytest
 
 from langraph_agent.checkpoints import resolve_checkpoint_db_path, sqlite_checkpointer
+from langraph_agent.config import config
 
 
-def test_resolve_checkpoint_db_path_uses_environment_override(
+def test_resolve_checkpoint_db_path_uses_config_override(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db_path = tmp_path / "custom.sqlite"
-    monkeypatch.setenv("LANGRAPH_CHECKPOINT_DB_PATH", str(db_path))
+    monkeypatch.setattr(config, "CHECKPOINT_DB_PATH", str(db_path))
 
     assert resolve_checkpoint_db_path() == db_path
 

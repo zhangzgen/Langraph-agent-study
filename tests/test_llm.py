@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from langraph_agent import llm as llm_module
+from langraph_agent.config import config
 
 
 def test_build_llm_disables_thinking_by_default(monkeypatch) -> None:
@@ -14,7 +15,8 @@ def test_build_llm_disables_thinking_by_default(monkeypatch) -> None:
             calls["tools"] = tools
             return self
 
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(config, "OPENAI_EXTRA_BODY", {"thinking": {"type": "disabled"}})
     monkeypatch.setattr(llm_module, "ChatOpenAI", FakeChatOpenAI)
 
     llm_module.build_llm()
@@ -30,10 +32,10 @@ def test_build_llm_uses_central_extra_body_config(monkeypatch) -> None:
         def __init__(self, **kwargs) -> None:
             calls.update(kwargs)
 
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "test-key")
     monkeypatch.setattr(llm_module, "ChatOpenAI", FakeChatOpenAI)
     monkeypatch.setattr(
-        llm_module,
+        config,
         "OPENAI_EXTRA_BODY",
         {"thinking": {"type": "enabled"}},
     )
