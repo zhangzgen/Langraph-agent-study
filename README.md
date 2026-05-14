@@ -132,6 +132,18 @@ uv run python react_agent.py --debug "阅读这个链接并总结重点：https:
 python react_agent.py --debug "北京现在几点？顺便算一下 23 * 47"
 ```
 
+启用计划模式时，Agent 会先生成任务列表和计划书，等待你审核；批准后再逐项进入 ReAct 执行，拒绝时会根据反馈重新规划：
+
+```bash
+uv run python react_agent.py --plan "帮我分析这个项目并给出改造建议"
+```
+
+需要明确关闭计划模式时可以使用：
+
+```bash
+uv run python react_agent.py --no-plan "北京现在几点？"
+```
+
 启动多轮对话：
 
 ```bash
