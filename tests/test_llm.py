@@ -22,6 +22,7 @@ def test_build_llm_disables_thinking_by_default(monkeypatch) -> None:
     llm_module.build_llm()
 
     assert calls["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert calls["streaming"] is True
     assert calls["tools"] == llm_module.TOOLS
 
 
@@ -43,3 +44,4 @@ def test_build_llm_uses_central_extra_body_config(monkeypatch) -> None:
     llm_module.build_llm(bind_tools=False)
 
     assert calls["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert calls["streaming"] is True

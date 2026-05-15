@@ -21,6 +21,7 @@ def build_llm(*, bind_tools: bool = True) -> ChatOpenAI:
         base_url=config.OPENAI_BASE_URL,
         temperature=config.OPENAI_TEMPERATURE,
         extra_body=config.OPENAI_EXTRA_BODY,
+        streaming=True,
     )
     if bind_tools:
         return llm.bind_tools(TOOLS)

@@ -44,10 +44,12 @@ def test_cli_chat_passes_checkpoint_db_path(
         thread_id: str,
         debug: bool,
         checkpoint_db_path: str | None,
+        stream_output: bool = True,
     ) -> None:
         calls["thread_id"] = thread_id
         calls["debug"] = debug
         calls["checkpoint_db_path"] = checkpoint_db_path
+        calls["stream_output"] = stream_output
 
     monkeypatch.setattr(graph, "chat", fake_chat)
     monkeypatch.setattr(
@@ -70,6 +72,7 @@ def test_cli_chat_passes_checkpoint_db_path(
         "thread_id": "demo-thread",
         "debug": True,
         "checkpoint_db_path": str(db_path),
+        "stream_output": True,
     }
 
 
@@ -89,10 +92,14 @@ def test_cli_run_passes_checkpoint_db_path(
         question: str,
         debug: bool,
         checkpoint_db_path: str | None,
+        stream_output: bool = True,
     ) -> AIMessage:
         calls["question"] = question
         calls["debug"] = debug
         calls["checkpoint_db_path"] = checkpoint_db_path
+        calls["stream_output"] = stream_output
+        if stream_output:
+            print("ok", end="")
         return AIMessage(content="ok")
 
     monkeypatch.setattr(graph, "run", fake_run)
@@ -108,5 +115,6 @@ def test_cli_run_passes_checkpoint_db_path(
         "question": "hello",
         "debug": False,
         "checkpoint_db_path": str(db_path),
+        "stream_output": True,
     }
     assert "ok" in capsys.readouterr().out

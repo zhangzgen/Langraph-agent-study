@@ -42,13 +42,11 @@ def main() -> None:
 
     from langraph_agent.graph import run
 
-    final_message = run(
+    if not args.debug:
+        print("\nFinal answer:")
+
+    run(
         args.question,
         debug=args.debug,
         checkpoint_db_path=args.checkpoint_db,
     )
-    if args.debug:
-        return
-
-    print("\nFinal answer:")
-    print(final_message.content)

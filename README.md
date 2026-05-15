@@ -103,6 +103,8 @@ python react_agent.py "北京现在几点？顺便算一下 23 * 47"
 uv run python react_agent.py "北京现在几点？顺便算一下 23 * 47"
 ```
 
+普通模式默认按 OpenAI SDK SSE 示例的 delta 风格流式打印回答：模型每返回一段内容就立即 `print(..., end="", flush=True)` 到控制台；`--debug` 也会显示 `[llm stream]` 实时正文，同时保留按 LangGraph 节点更新打印的学习视图。
+
 需要查询互联网实时信息时，配置 `TAVILY_API_KEY` 后可以让模型自动调用联网工具：
 
 - `web_search`: 用关键词搜索，返回搜索摘要和来源链接。这里的 `content` 是搜索结果片段，不是网页全文。

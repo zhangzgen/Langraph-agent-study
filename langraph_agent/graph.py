@@ -4,7 +4,7 @@ import json
 import uuid
 from pathlib import Path
 
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -163,6 +163,7 @@ def run(
     question: str,
     debug: bool = False,
     checkpoint_db_path: str | Path | None = None,
+    stream_output: bool = True,
 ) -> AIMessage:
     """运行一次性问答；启用 SQLite checkpointer 以支持工具审批恢复。"""
     inputs = {"messages": [{"role": "user", "content": question}]}
@@ -172,13 +173,20 @@ def run(
 
     with sqlite_checkpointer(checkpoint_db_path) as checkpointer:
         graph = build_graph(checkpointer=checkpointer)
-        return _invoke_graph(graph, inputs, config=graph_config, debug=debug)
+        return _invoke_graph(
+            graph,
+            inputs,
+            config=graph_config,
+            debug=debug,
+            stream_output=stream_output,
+        )
 
 
 def chat(
     thread_id: str = "default",
     debug: bool = False,
     checkpoint_db_path: str | Path | None = None,
+    stream_output: bool = True,
 ) -> None:
     """启动多轮对话；同一个 thread_id 会复用 LangGraph 历史状态。"""
     graph_config = {"configurable": {"thread_id": thread_id}}
@@ -203,16 +211,31 @@ def chat(
                 inputs,
                 config=graph_config,
                 debug=debug,
+                stream_output=stream_output,
+                stream_prefix="\n助手: ",
             )
-            if not debug:
+            if not debug and not stream_output:
                 print(f"\n助手: {final_message.content}")
 
 
-def _invoke_graph(graph, inputs: dict, config: dict | None, debug: bool) -> AIMessage:
+def _invoke_graph(
+    graph,
+    inputs: dict,
+    config: dict | None,
+    debug: bool,
+    stream_output: bool = True,
+    stream_prefix: str = "",
+) -> AIMessage:
     """执行图直到得到最终 AIMessage，并处理 interrupt/resume 审批循环。"""
     if not debug:
-        # invoke 会一次性跑到 END；如果遇到 interrupt，则人工确认后用 Command(resume=...)
-        # 从中断点恢复。
+        if stream_output:
+            return _stream_graph_to_console(
+                graph,
+                inputs,
+                config=config,
+                prefix=stream_prefix,
+            )
+
         next_input: dict | Command = inputs
         while True:
             result = graph.invoke(next_input, config=config)
@@ -221,25 +244,65 @@ def _invoke_graph(graph, inputs: dict, config: dict | None, debug: bool) -> AIMe
                 return result["messages"][-1]
             next_input = Command(resume=_prompt_for_interrupt_resume(interrupts))
 
-    # debug 模式用 stream 查看每个节点的增量输出。
-    # 这对学习 ReAct 很有用：可以看到 llm -> tools -> llm 的实际跳转。
+    # debug 模式同时监听 token 和节点更新：既能看到 SSE 风格输出，
+    # 也保留 llm -> tools -> llm 的节点跳转视图。
+    return _stream_debug_graph_to_console(graph, inputs, config=config)
+
+
+def _stream_debug_graph_to_console(
+    graph,
+    inputs: dict,
+    config: dict | None,
+) -> AIMessage:
+    """debug 模式下同时打印模型 delta 和 LangGraph 节点更新。"""
     final_message: AIMessage | None = None
     next_input: dict | Command = inputs
+    streaming_text = False
+    streamed_for_current_update = False
+
     while True:
         interrupted = False
-        for event in graph.stream(next_input, config=config, stream_mode="updates"):
-            interrupts = event.get("__interrupt__")
+        for mode, data in graph.stream(
+            next_input,
+            config=config,
+            stream_mode=["messages", "updates"],
+        ):
+            if mode == "messages":
+                message, metadata = data
+                if _should_print_stream_message(message, metadata):
+                    text = _extract_stream_text(message)
+                    if text:
+                        if not streaming_text:
+                            print("\n[llm stream]")
+                            streaming_text = True
+                        print(text, end="", flush=True)
+                        streamed_for_current_update = True
+                continue
+
+            if mode != "updates":
+                continue
+
+            if streaming_text:
+                print()
+                streaming_text = False
+
+            interrupts = data.get("__interrupt__")
             if interrupts:
+                streamed_for_current_update = False
                 next_input = Command(resume=_prompt_for_interrupt_resume(interrupts))
                 interrupted = True
                 break
 
-            for node_name, update in event.items():
+            for node_name, update in data.items():
                 print(f"\n[{node_name}]")
-                _print_debug_update(update)
+                _print_debug_update(
+                    update,
+                    suppress_ai_content=streamed_for_current_update,
+                )
                 for message in update.get("messages", []):
                     if isinstance(message, AIMessage):
                         final_message = message
+            streamed_for_current_update = False
         if not interrupted:
             break
 
@@ -248,10 +311,112 @@ def _invoke_graph(graph, inputs: dict, config: dict | None, debug: bool) -> AIMe
     return final_message
 
 
-def _print_debug_update(update: dict) -> None:
+def _stream_graph_to_console(
+    graph,
+    inputs: dict,
+    config: dict | None,
+    prefix: str = "",
+) -> AIMessage:
+    """像 OpenAI SDK 的 SSE 示例一样，逐块打印模型 delta。"""
+    final_message: AIMessage | None = None
+    next_input: dict | Command = inputs
+    printed_text = False
+
+    while True:
+        interrupted = False
+        for mode, data in graph.stream(
+            next_input,
+            config=config,
+            stream_mode=["messages", "updates"],
+        ):
+            if mode == "messages":
+                message, metadata = data
+                if _should_print_stream_message(message, metadata):
+                    text = _extract_stream_text(message)
+                    if text:
+                        if not printed_text and prefix:
+                            print(prefix, end="", flush=True)
+                        print(text, end="", flush=True)
+                        printed_text = True
+                continue
+
+            if mode != "updates":
+                continue
+
+            interrupts = data.get("__interrupt__")
+            if interrupts:
+                if printed_text:
+                    print()
+                    printed_text = False
+                next_input = Command(resume=_prompt_for_interrupt_resume(interrupts))
+                interrupted = True
+                break
+
+            for update in data.values():
+                for message in update.get("messages", []):
+                    if isinstance(message, AIMessage):
+                        final_message = message
+        if not interrupted:
+            break
+
+    if final_message is None:
+        raise RuntimeError("图执行结束，但没有得到 AIMessage。")
+
+    if printed_text:
+        print()
+    else:
+        text = _extract_stream_text(final_message)
+        if text:
+            if prefix:
+                print(prefix, end="", flush=True)
+            print(text, flush=True)
+
+    return final_message
+
+
+def _should_print_stream_message(message: BaseMessage, metadata: dict) -> bool:
+    """只把面向用户的 llm 节点 token 打到终端，跳过内部摘要等模型调用。"""
+    return (
+        isinstance(message, AIMessageChunk)
+        and metadata.get("langgraph_node") == "llm"
+    )
+
+
+def _extract_stream_text(message: BaseMessage) -> str:
+    """提取 chunk 中新增的文本 delta，兼容字符串和 OpenAI 内容块。"""
+    content = message.content
+    if isinstance(content, str):
+        return content
+
+    if not isinstance(content, list):
+        return ""
+
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict):
+            for key in ("text", "content"):
+                value = block.get(key)
+                if isinstance(value, str):
+                    parts.append(value)
+                    break
+    return "".join(parts)
+
+
+def _print_debug_update(
+    update: dict,
+    suppress_ai_content: bool = False,
+) -> None:
     """打印 debug stream 中一个节点的状态更新。"""
     for message in update.get("messages", []):
-        print(_format_message(message))
+        print(
+            _format_message(
+                message,
+                suppress_content=suppress_ai_content
+                and isinstance(message, AIMessage),
+            )
+        )
 
     total_tokens = update.get("last_total_tokens")
     if total_tokens is not None:
@@ -338,7 +503,10 @@ def _parse_approved_indices(answer: str, tool_call_ids: list[str]) -> list[str]:
     return approved
 
 
-def _format_message(message: BaseMessage) -> str:
+def _format_message(
+    message: BaseMessage,
+    suppress_content: bool = False,
+) -> str:
     """把 LangChain message 格式化为适合 debug 输出的文本。"""
     parts = [f"{message.type}:"]
 
@@ -355,7 +523,10 @@ def _format_message(message: BaseMessage) -> str:
         parts.append(f"total_tokens={total_tokens}")
 
     if message.content:
-        parts.append(f"content:\n{message.content}")
+        if suppress_content:
+            parts.append("content: <streamed above>")
+        else:
+            parts.append(f"content:\n{message.content}")
 
     return "\n".join(parts)
 
