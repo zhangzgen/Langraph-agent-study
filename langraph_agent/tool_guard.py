@@ -17,8 +17,9 @@ from langraph_agent.tools import TOOLS
 AUTO_APPROVED_TOOLS = {
     "calculator",
     "current_time",
-    "file_search",
-    "list_directory",
+    "glob",
+    "grep",
+    "ls",
     "list_skills",
     "load_skill",
     "read_file",
@@ -30,9 +31,7 @@ AUTO_APPROVED_TOOLS = {
 # interrupt 暂停图执行，等人类确认后才能继续。
 REVIEW_REQUIRED_TOOLS = {
     "bash",
-    "copy_file",
-    "file_delete",
-    "move_file",
+    "edit_file",
     "write_file",
 }
 SENSITIVE_PATH_PARTS = {

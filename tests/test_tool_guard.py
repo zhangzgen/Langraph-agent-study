@@ -15,11 +15,10 @@ def test_filesystem_tools_are_registered() -> None:
     names = {tool.name for tool in FILESYSTEM_TOOLS}
 
     assert {
-        "copy_file",
-        "file_delete",
-        "file_search",
-        "list_directory",
-        "move_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "ls",
         "read_file",
         "write_file",
     } <= names
@@ -49,7 +48,21 @@ def test_write_file_requires_review() -> None:
     tool_call = {
         "id": "call_write",
         "name": "write_file",
-        "args": {"file_path": "notes.txt", "text": "hello"},
+        "args": {"file_path": "notes.txt", "content": "hello"},
+    }
+
+    assert not tool_guard.should_auto_approve_tool_call(tool_call)
+
+
+def test_edit_file_requires_review() -> None:
+    tool_call = {
+        "id": "call_edit",
+        "name": "edit_file",
+        "args": {
+            "file_path": "notes.txt",
+            "old_string": "hello",
+            "new_string": "hi",
+        },
     }
 
     assert not tool_guard.should_auto_approve_tool_call(tool_call)
@@ -104,7 +117,7 @@ def test_tool_approval_state_machine_interrupts_and_resumes_with_rejection() -> 
                         {
                             "id": "call_write",
                             "name": "write_file",
-                            "args": {"file_path": "tmp.txt", "text": "hello"},
+                            "args": {"file_path": "tmp.txt", "content": "hello"},
                         }
                     ],
                 )
@@ -146,7 +159,7 @@ def test_tool_approval_state_machine_supports_partial_approval() -> None:
                         {
                             "id": "call_write",
                             "name": "write_file",
-                            "args": {"file_path": "tmp.txt", "text": "hello"},
+                            "args": {"file_path": "tmp.txt", "content": "hello"},
                         },
                         {
                             "id": "call_bash",
