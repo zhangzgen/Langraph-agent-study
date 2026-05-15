@@ -10,10 +10,6 @@ def main() -> None:
     parser.add_argument("question", nargs="?", default="北京现在几点？再计算 23 * 47。")
     parser.add_argument("--chat", action="store_true", help="Start multi-turn chat mode.")
     parser.add_argument("--debug", action="store_true", help="Print graph updates.")
-    plan_group = parser.add_mutually_exclusive_group()
-    plan_group.add_argument("--plan", dest="use_plan_mode", action="store_true", help="Enable plan mode before ReAct execution.")
-    plan_group.add_argument("--no-plan", dest="use_plan_mode", action="store_false", help="Disable plan mode and use original ReAct execution.")
-    parser.set_defaults(use_plan_mode=False)
     parser.add_argument(
         "--thread-id",
         default="default",
@@ -41,7 +37,6 @@ def main() -> None:
             thread_id=args.thread_id,
             debug=args.debug,
             checkpoint_db_path=args.checkpoint_db,
-            use_plan_mode=args.use_plan_mode,
         )
         return
 
@@ -51,7 +46,6 @@ def main() -> None:
         args.question,
         debug=args.debug,
         checkpoint_db_path=args.checkpoint_db,
-        use_plan_mode=args.use_plan_mode,
     )
     if args.debug:
         return
