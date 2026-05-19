@@ -78,6 +78,7 @@ OPENAI_TEMPERATURE=0
 TAVILY_API_KEY=你的 Tavily API Key
 TAVILY_EXTRACT_CONTENT_LIMIT=12000
 LANGRAPH_CHECKPOINT_DB_PATH=data/checkpoints.sqlite
+LANGRAPH_CHECKPOINT_DATABASE_URL=postgresql://langraph_agent:dev_password@localhost:5432/langraph_agent
 LANGRAPH_COMPACT_TOKEN_THRESHOLD=8000
 LANGRAPH_RECENT_MESSAGES_TO_KEEP=8
 LANGRAPH_COMMAND_TIMEOUT_SECONDS=30
@@ -173,6 +174,13 @@ LANGRAPH_CHECKPOINT_DB_PATH=data/study.sqlite uv run python react_agent.py --cha
 uv run python react_agent.py --chat --thread-id study-session-1 --checkpoint-db data/study.sqlite
 ```
 
+如果已经用 Docker 启动 PostgreSQL，可以改用 PostgreSQL checkpoint。项目会直接从 `.env` 读取 `LANGRAPH_CHECKPOINT_DATABASE_URL`；该值非空时优先使用 PostgreSQL，留空时回退 SQLite：
+
+```bash
+LANGRAPH_CHECKPOINT_DATABASE_URL=postgresql://langraph_agent:dev_password@localhost:5432/langraph_agent
+uv run python react_agent.py --chat --thread-id study-session-1
+```
+
 退出多轮对话时输入：
 
 ```text
@@ -237,10 +245,10 @@ ReAct 的关键点不是某个神秘框架 API，而是：
 graph.invoke({"messages": [{"role": "user", "content": question}]})
 ```
 
-多轮对话需要让图记住之前的 `messages`。这个项目默认使用 LangGraph 的 SQLite checkpointer，把状态保存到本地 SQLite 数据库：
+多轮对话需要让图记住之前的 `messages`。这个项目默认使用 LangGraph 的 SQLite checkpointer，把状态保存到本地 SQLite 数据库；配置 PostgreSQL URL 后会改用 PostgreSQL：
 
 ```python
-with sqlite_checkpointer("data/checkpoints.sqlite") as checkpointer:
+with checkpoint_saver() as checkpointer:
     graph = builder.compile(checkpointer=checkpointer)
 ```
 
@@ -256,7 +264,7 @@ graph.invoke(
 
 这样你每一轮只需要传“新增的用户消息”。LangGraph 会根据 `thread_id` 取回上一轮保存的 State，再把新消息追加进去。
 
-SQLite checkpoint 会跨进程保留同一个 `thread_id` 的历史。`build_graph(with_memory=True)` 仍保留 `MemorySaver` 路径，主要用于测试或临时内存实验；CLI 的 `run` 和 `chat` 路径默认使用 SQLite。
+SQLite 和 PostgreSQL checkpoint 都会跨进程保留同一个 `thread_id` 的历史。`build_graph(with_memory=True)` 仍保留 `MemorySaver` 路径，主要用于测试或临时内存实验；CLI 的 `run` 和 `chat` 路径会读取 `config.CHECKPOINT_DATABASE_URL`，该配置非空时优先使用 PostgreSQL，否则使用 SQLite。
 
 ## 状态压缩
 

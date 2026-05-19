@@ -40,6 +40,7 @@ class Config:
         "LANGRAPH_CHECKPOINT_DB_PATH",
         "data/checkpoints.sqlite",
     )
+    CHECKPOINT_DATABASE_URL = os.getenv("LANGRAPH_CHECKPOINT_DATABASE_URL", "")
     SQLITE_IN_MEMORY = os.getenv("LANGRAPH_SQLITE_IN_MEMORY", ":memory:")
 
     COMPACT_TOKEN_THRESHOLD = int(

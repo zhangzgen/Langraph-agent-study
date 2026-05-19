@@ -10,7 +10,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
-from langraph_agent.checkpoints import resolve_checkpoint_db_path, sqlite_checkpointer
+from langraph_agent.checkpoints import checkpoint_saver, describe_checkpoint_backend
 from langraph_agent.config import config
 from langraph_agent.context import (
     build_compacted_messages,
@@ -165,13 +165,13 @@ def run(
     checkpoint_db_path: str | Path | None = None,
     stream_output: bool = True,
 ) -> AIMessage:
-    """运行一次性问答；启用 SQLite checkpointer 以支持工具审批恢复。"""
+    """运行一次性问答；启用 checkpoint 以支持工具审批恢复。"""
     inputs = {"messages": [{"role": "user", "content": question}]}
     # 单次 run 也启用 checkpointer，因为 interrupt/resume 需要 thread_id
     # 找回暂停时的图状态。
     graph_config = {"configurable": {"thread_id": f"run-{uuid.uuid4()}"}}
 
-    with sqlite_checkpointer(checkpoint_db_path) as checkpointer:
+    with checkpoint_saver(checkpoint_db_path) as checkpointer:
         graph = build_graph(checkpointer=checkpointer)
         return _invoke_graph(
             graph,
@@ -191,11 +191,14 @@ def chat(
     """启动多轮对话；同一个 thread_id 会复用 LangGraph 历史状态。"""
     graph_config = {"configurable": {"thread_id": thread_id}}
 
-    with sqlite_checkpointer(checkpoint_db_path) as checkpointer:
+    with checkpoint_saver(checkpoint_db_path) as checkpointer:
         graph = build_graph(checkpointer=checkpointer)
         print("进入多轮对话模式。输入 exit、quit 或 q 结束。")
         print(f"thread_id: {thread_id}")
-        print(f"checkpoint_db: {resolve_checkpoint_db_path(checkpoint_db_path)}")
+        print(
+            "checkpoint_backend: "
+            f"{describe_checkpoint_backend(checkpoint_db_path)}"
+        )
 
         while True:
             question = input("\n你: ").strip()
