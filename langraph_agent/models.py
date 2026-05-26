@@ -31,6 +31,8 @@ class AgentState(TypedDict):
     session_summary: NotRequired[str]
     last_total_tokens: NotRequired[int]
     context_compaction: NotRequired[dict[str, Any]]
+    plan_document: NotRequired[str]
+    plan_approved: NotRequired[bool]
     pending_approvals: NotRequired[list[ToolApproval]]
     approved_tool_calls: NotRequired[list[dict[str, Any]]]
     rejected_tool_calls: NotRequired[list[dict[str, Any]]]

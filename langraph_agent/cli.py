@@ -11,6 +11,11 @@ def main() -> None:
     parser.add_argument("--chat", action="store_true", help="Start multi-turn chat mode.")
     parser.add_argument("--debug", action="store_true", help="Print graph updates.")
     parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="Ask clarifying questions and require plan approval before execution.",
+    )
+    parser.add_argument(
         "--thread-id",
         default="default",
         help="Conversation id used by LangGraph checkpointer in chat mode.",
@@ -37,16 +42,19 @@ def main() -> None:
             thread_id=args.thread_id,
             debug=args.debug,
             checkpoint_db_path=args.checkpoint_db,
+            plan_mode=args.plan,
         )
         return
 
     from langraph_agent.graph import run
 
     if not args.debug:
-        print("\nFinal answer:")
+        title = "Plan / final answer:" if args.plan else "Final answer:"
+        print(f"\n{title}")
 
     run(
         args.question,
         debug=args.debug,
         checkpoint_db_path=args.checkpoint_db,
+        plan_mode=args.plan,
     )

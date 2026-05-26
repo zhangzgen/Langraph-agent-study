@@ -4,11 +4,17 @@ import json
 import uuid
 from pathlib import Path
 
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+)
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 
 from langraph_agent.checkpoints import checkpoint_saver, describe_checkpoint_backend
 from langraph_agent.config import config
@@ -20,15 +26,19 @@ from langraph_agent.context import (
 )
 from langraph_agent.llm import build_llm
 from langraph_agent.models import AgentState
-from langraph_agent.prompt import build_react_prompt_messages
+from langraph_agent.prompt import build_plan_prompt_messages, build_react_prompt_messages
 from langraph_agent.skills.registry import discover_skills, format_skill_catalog
 from langraph_agent.tool_guard import (
     approval_gate_node,
+    build_tool_approval_request,
     classify_tool_calls_node,
     execute_tools_node,
     has_pending_approvals,
     has_tool_calls,
+    normalize_approved_call_ids,
+    should_auto_approve_tool_call,
 )
+from langraph_agent.tools import PLAN_TOOLS
 
 
 def build_graph(
@@ -36,9 +46,24 @@ def build_graph(
     checkpointer: BaseCheckpointSaver | None = None,
     compact_token_threshold: int = config.COMPACT_TOKEN_THRESHOLD,
     recent_messages_to_keep: int = config.RECENT_MESSAGES_TO_KEEP,
+    plan_mode: bool = False,
 ):
-    """构建 LangGraph ReAct 状态机，并按需启用 checkpointer。"""
+    """构建 LangGraph ReAct 状态机，并按需启用 checkpointer。
+
+    Description:
+        创建主执行 ReAct 图；启用 plan_mode 时，在主执行节点前插入计划阶段
+        ReAct 循环、计划书人工审核节点和按反馈重写计划的路由。
+    Args:
+        with_memory (bool): 未显式传入 checkpointer 时，是否启用内存 checkpoint。
+        checkpointer (BaseCheckpointSaver | None): 外部传入的 LangGraph checkpoint 实例。
+        compact_token_threshold (int): 触发上下文压缩的 token 阈值。
+        recent_messages_to_keep (int): 上下文压缩后保留的最近消息数量。
+        plan_mode (bool): 是否启用执行前计划模式。
+    Returns:
+        CompiledStateGraph: 可 invoke 或 stream 的 LangGraph 编译结果。
+    """
     llm = build_llm()
+    plan_llm = build_llm(tools=PLAN_TOOLS) if plan_mode else None
     summary_llm = build_llm(bind_tools=False)
     skill_catalog = format_skill_catalog(discover_skills())
 
@@ -47,6 +72,7 @@ def build_graph(
         prompt_messages = build_react_prompt_messages(
             skill_catalog=skill_catalog,
             session_summary=state.get("session_summary"),
+            plan_document=state.get("plan_document") if plan_mode else None,
         )
         # 这里是 ReAct 中的“Reason/Act 决策”阶段：
         # 模型读取用户问题和历史消息，决定直接回答，还是返回 tool_calls。
@@ -56,6 +82,117 @@ def build_graph(
         if total_tokens is not None:
             update["last_total_tokens"] = total_tokens
         return update
+
+    def call_plan_llm(state: AgentState) -> dict[str, object]:
+        """调用计划阶段模型生成澄清问题、读取文件或输出计划书。
+
+        Description:
+            使用 plan 专用 prompt 和工具集运行前置 ReAct 决策，模型可以继续调用
+            ask_human 或只读文件工具；无工具调用时，其输出会进入计划审核节点。
+        Args:
+            state (AgentState): 当前全局图状态，包含用户需求、澄清回答和历史消息。
+        Returns:
+            dict[str, object]: 包含计划阶段 AIMessage 和可选 token 统计的状态更新。
+        """
+        if plan_llm is None:
+            raise RuntimeError("plan_mode 未启用，不能调用计划节点。")
+        prompt_messages = build_plan_prompt_messages(
+            skill_catalog=skill_catalog,
+            session_summary=state.get("session_summary"),
+        )
+        response = plan_llm.invoke([*prompt_messages, *state["messages"]])
+        update: dict[str, object] = {"messages": [response]}
+        total_tokens = extract_total_tokens(response)
+        if total_tokens is not None:
+            update["last_total_tokens"] = total_tokens
+        return update
+
+    def execute_plan_tools(state: AgentState) -> dict[str, list[ToolMessage]]:
+        """执行计划阶段的工具调用。
+
+        Description:
+            按模型返回的 tool_calls 顺序执行 ask_human 与只读文件工具。ask_human
+            通过 LangGraph interrupt 暂停并收集用户回答，其他工具直接调用。
+        Args:
+            state (AgentState): 当前全局图状态，最后一条消息应为包含 tool_calls 的 AIMessage。
+        Returns:
+            dict[str, list[ToolMessage]]: 每个工具调用对应的 ToolMessage 状态更新。
+        """
+        last_message = state["messages"][-1]
+        tool_calls = list(getattr(last_message, "tool_calls", None) or [])
+        plan_tools_by_name = {tool.name: tool for tool in PLAN_TOOLS}
+        messages = []
+        for tool_call in tool_calls:
+            tool_name = tool_call.get("name") or ""
+            tool_call_id = tool_call.get("id") or tool_name
+            args = tool_call.get("args") or {}
+            tool = plan_tools_by_name.get(tool_name)
+            if tool is None:
+                content = f"未知计划工具，未执行: {tool_name}"
+            elif tool_name == "ask_human":
+                content = str(tool.invoke(args))
+            elif not should_auto_approve_tool_call(tool_call):
+                decision = interrupt(build_tool_approval_request([tool_call]))
+                approved_ids = normalize_approved_call_ids(decision, [tool_call])
+                if tool_call_id not in approved_ids:
+                    content = f"用户未批准计划工具 {tool_name}，因此该工具调用没有执行。"
+                else:
+                    try:
+                        content = str(tool.invoke(args))
+                    except Exception as exc:
+                        content = f"计划工具 {tool_name} 执行失败: {exc}"
+            else:
+                try:
+                    content = str(tool.invoke(args))
+                except Exception as exc:
+                    content = f"计划工具 {tool_name} 执行失败: {exc}"
+            messages.append(
+                ToolMessage(content=content, tool_call_id=tool_call_id, name=tool_name)
+            )
+        return {"messages": messages}
+
+    def review_plan(state: AgentState) -> dict[str, object]:
+        """请求用户审核计划书，并根据结果更新全局状态。
+
+        Description:
+            将计划阶段最后一条 AIMessage 作为计划书发给用户审核。用户直接回车或
+            输入 yes 表示通过；否则把输入作为调整意见返回给计划模型重写计划书。
+        Args:
+            state (AgentState): 当前全局图状态，最后一条消息应为计划书 AIMessage。
+        Returns:
+            dict[str, object]: 计划书、审核结果以及供后续节点继续推理的消息更新。
+        """
+        plan_document = _extract_stream_text(state["messages"][-1]).strip()
+        decision = interrupt(
+            {
+                "type": "plan_review",
+                "message": "请审核计划书。直接回车或输入 yes 通过；否则输入调整意见。",
+                "plan": plan_document,
+            }
+        )
+        if isinstance(decision, dict) and decision.get("approved"):
+            return {
+                "plan_document": plan_document,
+                "plan_approved": True,
+                "messages": [
+                    HumanMessage(content="用户已审核通过计划书。请严格按照计划书执行当前任务。")
+                ],
+            }
+        feedback = ""
+        if isinstance(decision, dict):
+            feedback = str(decision.get("feedback") or "").strip()
+        return {
+            "plan_document": plan_document,
+            "plan_approved": False,
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "用户未通过计划书。请根据以下调整意见重新制定计划书："
+                        f"{feedback or '用户要求重新调整计划书。'}"
+                    )
+                )
+            ],
+        }
 
     def summarize_and_compact(state: AgentState) -> dict[str, object]:
         """把旧消息压缩进摘要，并物理裁剪 messages 状态。"""
@@ -88,13 +225,36 @@ def build_graph(
 
     # llm 节点：负责调用模型，让模型判断下一步。
     builder.add_node("llm", call_llm)
+    if plan_mode:
+        builder.add_node("plan_llm", call_plan_llm)
+        builder.add_node("execute_plan_tools", execute_plan_tools)
+        builder.add_node("review_plan", review_plan)
     builder.add_node("classify_tool_calls", classify_tool_calls_node)
     builder.add_node("approval_gate", approval_gate_node)
     builder.add_node("execute_tools", execute_tools_node)
     builder.add_node("summarize_and_compact", summarize_and_compact)
 
-    # 图从 START 进入 llm。
-    builder.add_edge(START, "llm")
+    # 图从 START 进入 llm；启用 plan 时先进入计划阶段。
+    if plan_mode:
+        builder.add_edge(START, "plan_llm")
+        builder.add_conditional_edges(
+            "plan_llm",
+            lambda state: "execute_plan_tools"
+            if has_tool_calls(state)
+            else "review_plan",
+            {
+                "execute_plan_tools": "execute_plan_tools",
+                "review_plan": "review_plan",
+            },
+        )
+        builder.add_edge("execute_plan_tools", "plan_llm")
+        builder.add_conditional_edges(
+            "review_plan",
+            lambda state: "llm" if state.get("plan_approved") else "plan_llm",
+            {"llm": "llm", "plan_llm": "plan_llm"},
+        )
+    else:
+        builder.add_edge(START, "llm")
 
     # 如果上一条 AIMessage 有 tool_calls，就进入工具状态机；否则结束。
     builder.add_conditional_edges(
@@ -164,15 +324,29 @@ def run(
     debug: bool = False,
     checkpoint_db_path: str | Path | None = None,
     stream_output: bool = True,
+    plan_mode: bool = False,
 ) -> AIMessage:
-    """运行一次性问答；启用 checkpoint 以支持工具审批恢复。"""
+    """运行一次性问答；启用 checkpoint 以支持工具审批恢复。
+
+    Description:
+        使用临时 thread_id 执行一次用户请求。plan_mode 为 True 时，会先进入
+        计划阶段澄清和计划书审核，再路由到主执行 ReAct。
+    Args:
+        question (str): 用户输入的任务需求。
+        debug (bool): 是否打印 LangGraph 节点更新。
+        checkpoint_db_path (str | Path | None): SQLite checkpoint 路径覆盖值。
+        stream_output (bool): 是否流式打印模型正文。
+        plan_mode (bool): 是否启用计划阶段。
+    Returns:
+        AIMessage: 图执行结束后的最终 AI 消息。
+    """
     inputs = {"messages": [{"role": "user", "content": question}]}
     # 单次 run 也启用 checkpointer，因为 interrupt/resume 需要 thread_id
     # 找回暂停时的图状态。
     graph_config = {"configurable": {"thread_id": f"run-{uuid.uuid4()}"}}
 
     with checkpoint_saver(checkpoint_db_path) as checkpointer:
-        graph = build_graph(checkpointer=checkpointer)
+        graph = build_graph(checkpointer=checkpointer, plan_mode=plan_mode)
         return _invoke_graph(
             graph,
             inputs,
@@ -187,12 +361,26 @@ def chat(
     debug: bool = False,
     checkpoint_db_path: str | Path | None = None,
     stream_output: bool = True,
+    plan_mode: bool = False,
 ) -> None:
-    """启动多轮对话；同一个 thread_id 会复用 LangGraph 历史状态。"""
+    """启动多轮对话；同一个 thread_id 会复用 LangGraph 历史状态。
+
+    Description:
+        在命令行中持续读取用户输入，并用同一个 thread_id 复用 checkpoint
+        历史。plan_mode 为 True 时，每轮用户需求都会先经过计划审核。
+    Args:
+        thread_id (str): 多轮会话使用的 checkpoint 会话 ID。
+        debug (bool): 是否打印 LangGraph 节点更新。
+        checkpoint_db_path (str | Path | None): SQLite checkpoint 路径覆盖值。
+        stream_output (bool): 是否流式打印模型正文。
+        plan_mode (bool): 是否启用计划阶段。
+    Returns:
+        None: 该函数直接在 CLI 中打印对话结果。
+    """
     graph_config = {"configurable": {"thread_id": thread_id}}
 
     with checkpoint_saver(checkpoint_db_path) as checkpointer:
-        graph = build_graph(checkpointer=checkpointer)
+        graph = build_graph(checkpointer=checkpointer, plan_mode=plan_mode)
         print("进入多轮对话模式。输入 exit、quit 或 q 结束。")
         print(f"thread_id: {thread_id}")
         print(
@@ -381,7 +569,7 @@ def _should_print_stream_message(message: BaseMessage, metadata: dict) -> bool:
     """只把面向用户的 llm 节点 token 打到终端，跳过内部摘要等模型调用。"""
     return (
         isinstance(message, AIMessageChunk)
-        and metadata.get("langgraph_node") == "llm"
+        and metadata.get("langgraph_node") in {"llm", "plan_llm"}
     )
 
 
@@ -435,11 +623,15 @@ def _print_debug_update(
         print(json.dumps(compaction, ensure_ascii=False, indent=2))
 
 
-def _prompt_for_interrupt_resume(interrupts) -> dict[str, bool] | dict[str, list[str]]:
+def _prompt_for_interrupt_resume(interrupts) -> dict[str, object]:
     """在 CLI 中展示 interrupt 审批请求，并返回 Command(resume=...) 所需数据。"""
     tool_call_ids = []
     for interrupt_item in interrupts:
         value = getattr(interrupt_item, "value", interrupt_item)
+        if isinstance(value, dict) and value.get("type") == "ask_human":
+            return _prompt_for_ask_human(value)
+        if isinstance(value, dict) and value.get("type") == "plan_review":
+            return _prompt_for_plan_review(value)
         tool_call_ids.extend(
             _print_tool_approval_request(
                 value,
@@ -461,6 +653,53 @@ def _prompt_for_interrupt_resume(interrupts) -> dict[str, bool] | dict[str, list
 
     approved_call_ids = _parse_approved_indices(answer, tool_call_ids)
     return {"approved_call_ids": approved_call_ids}
+
+
+def _prompt_for_ask_human(value: dict) -> dict[str, str]:
+    """在 CLI 中展示 ask_human 提示并收集用户输入。
+
+    Description:
+        展示 ask_human 工具已格式化的选择题或说明题文本，使用 input 收集用户
+        的选择编号或反馈内容，并作为 Command(resume=...) 数据返回。
+    Args:
+        value (dict): ask_human 工具通过 interrupt 发出的展示请求。
+    Returns:
+        dict[str, str]: 包含 answer 字段的中断恢复数据。
+    """
+    print("\n[ask-human] 计划阶段需要补充信息")
+    print(str(value.get("display") or "请补充说明需求。"))
+    try:
+        answer = input("你的回答: ").strip()
+    except (EOFError, OSError):
+        answer = ""
+    return {"answer": answer}
+
+
+def _prompt_for_plan_review(value: dict) -> dict[str, object]:
+    """在 CLI 中展示计划书并收集审核结论。
+
+    Description:
+        处理 plan_review interrupt 请求。用户直接回车或输入 yes 表示通过；
+        其他非空输入会作为调整意见返回给计划模型。
+    Args:
+        value (dict): review_plan 节点发出的结构化请求，包含计划书正文。
+    Returns:
+        dict[str, object]: 包含 approved 或 feedback 的 Command(resume=...) 数据。
+    """
+    print("\n[plan review] 需要审核计划书")
+    plan = str(value.get("plan") or "").strip()
+    if plan:
+        print(plan)
+    message = value.get("message")
+    if message:
+        print(str(message))
+    try:
+        answer = input("审核意见: ").strip()
+    except (EOFError, OSError):
+        answer = ""
+    if answer.lower() in {"", "y", "yes"}:
+        return {"approved": True}
+    return {"approved": False, "feedback": answer}
 
 
 def _print_tool_approval_request(value, start_index: int = 1) -> list[str]:
