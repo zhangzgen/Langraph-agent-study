@@ -627,6 +627,8 @@ class FeishuBotService:
         self._chat_locks: dict[str, threading.Lock] = {}
         self._state_lock = threading.Lock()
         if self._approval_store is not None:
+            for session in self._approval_store.list_abandoned_sessions():
+                self._executor.submit(self._fail_abandoned_session, session["card_id"])
             for session in self._approval_store.list_recoverable_sessions():
                 self._executor.submit(self._continue_tool_action, session["card_id"])
 
@@ -1023,6 +1025,31 @@ class FeishuBotService:
                     self._replace_persisted_card(card_id)
                 except Exception:
                     LOGGER.exception("飞书审批失败状态更新失败，card_id=%s", card_id)
+
+    def _fail_abandoned_session(self, card_id: str) -> None:
+        """终止服务重启前遗留且无法恢复的卡片会话。
+
+        Description:
+            将缺少审批恢复入口的活动卡片收敛为失败状态，并把中断提示更新到
+            原卡片，使对应聊天可以继续接收新的问题。
+        Args:
+            card_id (str): 需要终止的 CardKit 卡片实体标识。
+        Returns:
+            None: 会话状态和远端卡片在可行时同步更新。
+        """
+        store = self._require_approval_store()
+        interruption_text = "回答因服务重启中断，请重新发送问题。"
+        try:
+            session = store.get_session(card_id)
+            if session["status"] not in {"generating", "pending_approval", "executing"}:
+                return
+            store.set_status(card_id, "failed")
+            store.update_answer(card_id, interruption_text)
+            if store.list_content_blocks(card_id):
+                store.append_text_block(card_id, interruption_text)
+            self._replace_persisted_card(card_id)
+        except Exception:
+            LOGGER.exception("飞书中断会话清理失败，card_id=%s", card_id)
 
     def _replace_persisted_card(self, card_id: str) -> None:
         """使用数据库中的最新会话状态覆盖远端卡片。

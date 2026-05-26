@@ -249,6 +249,51 @@ class FeishuApprovalStore:
             ).fetchall()
         return [self.get_session(row["card_id"]) for row in rows]
 
+    def list_abandoned_sessions(self) -> list[CardSession]:
+        """列出服务重启后无法继续执行的活动会话。
+
+        Description:
+            找出没有审批恢复入口的生成中或执行中卡片，以及缺少可展示审批项的
+            异常待审批卡片。这些会话无法从 checkpoint 安全补交原输入，应在
+            服务启动时结束，避免持续拦截同一聊天的新问题。
+        Args:
+            无。
+        Returns:
+            list[CardSession]: 应被收敛为失败状态的持久化卡片会话列表。
+        """
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.card_id
+                FROM feishu_card_sessions s
+                WHERE s.status = 'generating'
+                   OR (
+                       s.status = 'executing'
+                       AND NOT (
+                           EXISTS (
+                               SELECT 1 FROM feishu_tool_approvals t
+                               WHERE t.card_id = s.card_id
+                                 AND t.approval_required = 1
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM feishu_tool_approvals t
+                               WHERE t.card_id = s.card_id AND t.status = 'pending'
+                           )
+                       )
+                   )
+                   OR (
+                       s.status = 'pending_approval'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM feishu_tool_approvals t
+                           WHERE t.card_id = s.card_id
+                             AND t.approval_required = 1
+                       )
+                   )
+                ORDER BY s.created_at
+                """
+            ).fetchall()
+        return [self.get_session(row["card_id"]) for row in rows]
+
     def update_answer(self, card_id: str, text: str) -> None:
         """保存卡片当前已展示的模型正文。
 

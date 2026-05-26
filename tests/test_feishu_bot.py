@@ -427,3 +427,45 @@ def test_interactive_card_approves_tools_one_by_one_then_resumes(
     assert "**工具调用：`bash`** (已拒绝)" in final_content
     assert "```bash\npytest -q\n```" in final_content
     assert final_card["body"]["elements"][-1]["content"] == "处理完成"
+
+
+def test_restart_fails_abandoned_active_sessions_and_unlocks_chat(
+    tmp_path: Path,
+) -> None:
+    """验证服务重启会终止没有恢复入口的活动卡片。
+
+    Description:
+        预置生成中和无审批恢复入口的执行中会话，初始化新服务后确认两者被
+        更新为失败卡片，且聊天不再被活动会话查询拦截。
+    Args:
+        tmp_path (Path): pytest 提供的临时审批数据库目录。
+    Returns:
+        None: 测试通过断言校验持久化状态与卡片刷新内容。
+    """
+    client = FakeFeishuClient()
+    runner = FakeInteractiveRunner()
+    store = FeishuApprovalStore(tmp_path / "approvals.sqlite")
+    store.create_session("card-generating", "oc_generating", "feishu:oc_generating")
+    store.create_session("card-executing", "oc_executing", "feishu:oc_executing")
+    store.set_status("card-executing", "executing")
+
+    restarted_service = FeishuBotService(
+        client,
+        agent_runner=runner,
+        approval_store=store,
+        update_interval_ms=0,
+    )
+    restarted_service.close()
+
+    assert store.get_session("card-generating")["status"] == "failed"
+    assert store.get_session("card-executing")["status"] == "failed"
+    assert store.find_active_session("oc_generating") is None
+    assert store.find_active_session("oc_executing") is None
+    replaced_cards = {
+        call[1]: call[2] for call in client.calls if call[0] == "replace"
+    }
+    for card_id in {"card-generating", "card-executing"}:
+        elements = replaced_cards[card_id]["body"]["elements"]
+        assert replaced_cards[card_id]["config"]["streaming_mode"] is False
+        assert elements[0]["content"] == "**状态：失败**"
+        assert elements[1]["content"] == "回答因服务重启中断，请重新发送问题。"
