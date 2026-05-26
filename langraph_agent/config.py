@@ -51,6 +51,18 @@ class Config:
     COMMAND_TIMEOUT_SECONDS = int(os.getenv("LANGRAPH_COMMAND_TIMEOUT_SECONDS", "30"))
     OUTPUT_LIMIT = int(os.getenv("LANGRAPH_OUTPUT_LIMIT", "8000"))
 
+    FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
+    FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
+    FEISHU_BASE_URL = os.getenv("FEISHU_BASE_URL", "https://open.feishu.cn").rstrip("/")
+    FEISHU_CARD_UPDATE_INTERVAL_MS = int(
+        os.getenv("FEISHU_CARD_UPDATE_INTERVAL_MS", "250")
+    )
+    FEISHU_WORKER_COUNT = int(os.getenv("FEISHU_WORKER_COUNT", "4"))
+    FEISHU_APPROVAL_DB_PATH = os.getenv(
+        "FEISHU_APPROVAL_DB_PATH",
+        "data/feishu_approvals.sqlite",
+    )
+
     REACT_PROMPT_ID = os.getenv(
         "LANGRAPH_REACT_PROMPT_ID",
         "langraph-agent-react-system",

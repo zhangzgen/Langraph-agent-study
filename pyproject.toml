@@ -16,6 +16,8 @@ dependencies = [
     "deepagents>=0.6.1",
     "langgraph-checkpoint-postgres>=3.1.0",
     "psycopg[binary]>=3.3.4",
+    "httpx>=0.27.0",
+    "lark-oapi>=1.6.6",
 ]
 
 [dependency-groups]
@@ -25,6 +27,7 @@ dev = [
 
 [project.scripts]
 react-agent = "langraph_agent.cli:main"
+feishu-agent = "langraph_agent.feishu_bot:main"
 
 [build-system]
 requires = ["setuptools>=68"]
