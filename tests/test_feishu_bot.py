@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import httpx
 from langchain_core.messages import AIMessage
+from langgraph.types import Command
 
+from langraph_agent.feishu_approvals import FeishuApprovalStore
 from langraph_agent.feishu_bot import CardStreamWriter, FeishuBotService, FeishuOpenAPIClient
+from langraph_agent.graph import ChannelRunOutcome
 
 
 def test_feishu_open_api_client_sends_cardkit_requests() -> None:
@@ -52,7 +56,12 @@ def test_feishu_open_api_client_sends_cardkit_requests() -> None:
         card_id = client.create_streaming_card()
         client.send_card("chat-1", card_id)
         client.update_card_text(card_id, "hello", 1)
-        client.finish_streaming_card(card_id, 2)
+        client.replace_card(
+            card_id,
+            {"schema": "2.0", "body": {"elements": []}},
+            2,
+        )
+        client.finish_streaming_card(card_id, 3)
     finally:
         client.close()
 
@@ -64,12 +73,16 @@ def test_feishu_open_api_client_sends_cardkit_requests() -> None:
     card = json.loads(create_body["data"])
     assert card["schema"] == "2.0"
     assert card["config"]["streaming_mode"] is True
-    assert card["body"]["elements"][0]["element_id"] == "answer"
+    assert card["body"]["elements"][0]["element_id"] == "status"
+    assert card["body"]["elements"][1]["element_id"] == "answer"
     send_body = requests[2][2]
     assert send_body["msg_type"] == "interactive"
     assert json.loads(send_body["content"])["data"]["card_id"] == "card-1"
     assert requests[3][2]["content"] == "hello"
+    assert requests[4][1] == "/open-apis/cardkit/v1/cards/card-1"
     assert requests[4][2]["sequence"] == 2
+    assert json.loads(requests[4][2]["card"]["data"])["schema"] == "2.0"
+    assert requests[5][2]["sequence"] == 3
 
 
 class FakeFeishuClient:
@@ -113,7 +126,13 @@ class FakeFeishuClient:
         """
         self.calls.append(("send_card", chat_id, card_id))
 
-    def update_card_text(self, card_id: str, text: str, sequence: int) -> None:
+    def update_card_text(
+        self,
+        card_id: str,
+        text: str,
+        sequence: int,
+        element_id: str = "answer",
+    ) -> None:
         """记录卡片正文更新动作。
 
         Description:
@@ -122,10 +141,11 @@ class FakeFeishuClient:
             card_id (str): 目标卡片 ID。
             text (str): 完整回答正文。
             sequence (int): 更新序号。
+            element_id (str): 当前更新的 markdown 内容块 ID。
         Returns:
             None: 该方法只记录调用。
         """
-        self.calls.append(("update", card_id, text, sequence))
+        self.calls.append(("update", card_id, text, sequence, element_id))
 
     def finish_streaming_card(self, card_id: str, sequence: int) -> None:
         """记录卡片流式完成动作。
@@ -139,6 +159,20 @@ class FakeFeishuClient:
             None: 该方法只记录调用。
         """
         self.calls.append(("finish", card_id, sequence))
+
+    def replace_card(self, card_id: str, card: dict, sequence: int) -> None:
+        """记录整卡覆盖动作。
+
+        Description:
+            保存交互状态切换时生成的 Card JSON 与更新序号。
+        Args:
+            card_id (str): 目标卡片 ID。
+            card (dict): 待展示的完整卡片数据。
+            sequence (int): 更新序号。
+        Returns:
+            None: 该方法只记录调用。
+        """
+        self.calls.append(("replace", card_id, card, sequence))
 
     def send_text(self, chat_id: str, text: str) -> None:
         """记录普通文本发送动作。
@@ -213,6 +247,183 @@ def test_bot_service_maps_chat_to_thread_and_finishes_card() -> None:
 
     assert stream_calls == [("你好", "feishu:oc_chat", None)]
     assert ("send_card", "oc_chat", "card-1") in client.calls
-    assert ("update", "card-1", "你", 1) in client.calls
-    assert ("update", "card-1", "你好", 2) in client.calls
+    assert ("update", "card-1", "你", 1, "answer") in client.calls
+    assert ("update", "card-1", "你好", 2, "answer") in client.calls
     assert ("finish", "card-1", 3) in client.calls
+
+
+class FakeInteractiveRunner:
+    """模拟先产生两项审批、再按聚合决定恢复完成的渠道运行器。"""
+
+    def __init__(self) -> None:
+        """初始化运行输入记录。
+
+        Description:
+            创建用于断言仅在全部审批完成后恢复图的输入列表。
+        Args:
+            无。
+        Returns:
+            None: 该方法仅初始化记录状态。
+        """
+        self.inputs: list[str | Command] = []
+
+    def __call__(
+        self,
+        next_input: str | Command,
+        thread_id: str,
+        on_text,
+        on_tool_calls,
+        checkpoint_db_path: str | None,
+    ) -> ChannelRunOutcome:
+        """返回固定的中断或完成结果。
+
+        Description:
+            首次调用上报两个需审批工具并中断；恢复调用输出最终正文并完成。
+        Args:
+            next_input (str | Command): 用户问题或恢复命令。
+            thread_id (str): 当前 checkpoint thread 标识。
+            on_text (Callable): 模型文本更新回调。
+            on_tool_calls (Callable): 工具概要更新回调。
+            checkpoint_db_path (str | None): 测试未使用的 checkpoint 路径。
+        Returns:
+            ChannelRunOutcome: 首次为审批中断，第二次为已完成结果。
+        """
+        assert thread_id == "feishu:oc_chat"
+        assert checkpoint_db_path is None
+        self.inputs.append(next_input)
+        if len(self.inputs) == 1:
+            on_text("开始处理。")
+            tool_calls = [
+                {
+                    "id": "call_write",
+                    "name": "write_file",
+                    "approval_required": True,
+                    "display_content": "目标路径：`notes.txt`",
+                },
+                {
+                    "id": "call_bash",
+                    "name": "bash",
+                    "approval_required": True,
+                    "display_content": "执行命令：\n```bash\npytest -q\n```",
+                },
+            ]
+            on_tool_calls(tool_calls)
+            return ChannelRunOutcome(
+                final_message=None,
+                interrupt_request={
+                    "type": "tool_approval",
+                    "tool_calls": [
+                        {"id": "call_write", "name": "write_file"},
+                        {"id": "call_bash", "name": "bash"},
+                    ],
+                },
+            )
+        assert isinstance(next_input, Command)
+        assert next_input.resume == {"approved_call_ids": ["call_write"]}
+        on_text("处理")
+        on_text("处理完成")
+        return ChannelRunOutcome(
+            final_message=AIMessage(content="处理完成"),
+            interrupt_request=None,
+        )
+
+
+def test_interactive_card_approves_tools_one_by_one_then_resumes(
+    tmp_path: Path,
+) -> None:
+    """验证卡片逐项审批并在全部决定后恢复同一会话。
+
+    Description:
+        模拟两个需审核工具，断言第一次按钮动作只切换下一项，重复动作被忽略，
+        并模拟最后一项决定落库后由重投动作恢复 LangGraph 并完成原卡片。
+    Args:
+        tmp_path (Path): pytest 提供的临时审批数据库目录。
+    Returns:
+        None: 测试只通过断言校验持久化状态与卡片内容。
+    """
+    client = FakeFeishuClient()
+    runner = FakeInteractiveRunner()
+    store = FeishuApprovalStore(tmp_path / "approvals.sqlite")
+    service = FeishuBotService(
+        client,
+        agent_runner=runner,
+        approval_store=store,
+        update_interval_ms=0,
+    )
+    service._answer_message("oc_chat", "请修改文件并执行命令")
+
+    session = store.get_session("card-1")
+    assert session["status"] == "pending_approval"
+    pending_card = [call for call in client.calls if call[0] == "replace"][-1][2]
+    assert pending_card["config"]["streaming_mode"] is False
+    pending_elements = pending_card["body"]["elements"]
+    assert (
+        pending_elements[5]["columns"][0]["elements"][0]["behaviors"][0]["value"][
+            "tool_call_id"
+        ]
+        == "call_write"
+    )
+    assert pending_elements[1]["content"] == "开始处理。"
+    assert pending_elements[2]["tag"] == "hr"
+    assert pending_elements[5]["tag"] == "column_set"
+    assert [column["elements"][0]["text"]["content"] for column in pending_elements[5]["columns"]] == [
+        "批准",
+        "拒绝",
+    ]
+    assert "```bash\npytest -q\n```" in pending_elements[7]["content"]
+    assert all(element["tag"] != "action" for element in pending_elements)
+
+    service._handle_tool_action(
+        {
+            "action": "approve_tool",
+            "card_id": "card-1",
+            "tool_call_id": "call_write",
+            "action_key": "card-1:call_write:approve",
+        }
+    )
+    service._handle_tool_action(
+        {
+            "action": "approve_tool",
+            "card_id": "card-1",
+            "tool_call_id": "call_write",
+            "action_key": "card-1:call_write:approve",
+        }
+    )
+    assert len(runner.inputs) == 1
+    second_card = [call for call in client.calls if call[0] == "replace"][-1][2]
+    second_columns = next(
+        element for element in second_card["body"]["elements"] if element["tag"] == "column_set"
+    )
+    assert (
+        second_columns["columns"][0]["elements"][0]["behaviors"][0]["value"]["tool_call_id"]
+        == "call_bash"
+    )
+
+    assert store.decide_tool(
+        "card-1",
+        "call_bash",
+        approved=False,
+        action_key="card-1:call_bash:reject",
+    )
+    service.close()
+    restarted_service = FeishuBotService(
+        client,
+        agent_runner=runner,
+        approval_store=store,
+        update_interval_ms=0,
+    )
+    restarted_service.close()
+
+    completed = store.get_session("card-1")
+    final_card = [call for call in client.calls if call[0] == "replace"][-1][2]
+    final_content = "\n".join(
+        element.get("content", "") for element in final_card["body"]["elements"]
+    )
+    assert completed["status"] == "completed"
+    assert len(runner.inputs) == 2
+    assert final_card["config"]["streaming_mode"] is False
+    assert "开始处理。" in final_content
+    assert "**工具调用：`write_file`** (已批准)" in final_content
+    assert "**工具调用：`bash`** (已拒绝)" in final_content
+    assert "```bash\npytest -q\n```" in final_content
+    assert final_card["body"]["elements"][-1]["content"] == "处理完成"

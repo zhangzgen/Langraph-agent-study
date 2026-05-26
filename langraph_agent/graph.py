@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from langchain_core.messages import (
     AIMessage,
@@ -40,6 +42,14 @@ from langraph_agent.tool_guard import (
     should_auto_approve_tool_call,
 )
 from langraph_agent.tools import PLAN_TOOLS
+
+
+@dataclass(frozen=True)
+class ChannelRunOutcome:
+    """描述一次渠道侧图执行已结束或暂停的结果。"""
+
+    final_message: AIMessage | None
+    interrupt_request: dict[str, Any] | None
 
 
 def build_graph(
@@ -475,6 +485,160 @@ def stream_answer(
     if final_text and final_text != streamed_text:
         on_text(final_text)
     return final_message
+
+
+def stream_answer_until_interrupt(
+    next_input: str | Command,
+    thread_id: str,
+    on_text: Callable[[str], None],
+    on_tool_calls: Callable[[list[dict[str, Any]]], None],
+    checkpoint_db_path: str | Path | None = None,
+) -> ChannelRunOutcome:
+    """为交互渠道执行图直到完成或产生中断。
+
+    Description:
+        以用户新问题或 `Command(resume=...)` 启动一个 LangGraph 执行片段，持续
+        回调面向用户的模型正文和工具名称；遇到审批中断时保留 checkpoint 并立即
+        返回中断请求，不擅自替用户作出决定。
+    Args:
+        next_input (str | Command): 新用户问题文本，或恢复暂停图所需的命令。
+        thread_id (str): 复用对话 checkpoint 的会话标识。
+        on_text (Callable[[str], None]): 接收本执行片段累计模型正文的回调。
+        on_tool_calls (Callable[[list[dict[str, Any]]], None]): 接收工具名称与审批属性的回调。
+        checkpoint_db_path (str | Path | None): SQLite checkpoint 路径覆盖值。
+    Returns:
+        ChannelRunOutcome: 已完成时包含最终消息；暂停时包含结构化中断请求。
+    """
+    inputs: dict[str, Any] | Command
+    if isinstance(next_input, str):
+        inputs = {"messages": [{"role": "user", "content": next_input}]}
+    else:
+        inputs = next_input
+    graph_config = {"configurable": {"thread_id": thread_id}}
+    final_message: AIMessage | None = None
+    streamed_text = ""
+
+    with checkpoint_saver(checkpoint_db_path) as checkpointer:
+        graph = build_graph(checkpointer=checkpointer)
+        for mode, data in graph.stream(
+            inputs,
+            config=graph_config,
+            stream_mode=["messages", "updates"],
+        ):
+            if mode == "messages":
+                message, metadata = data
+                if _should_print_stream_message(message, metadata):
+                    text = _extract_stream_text(message)
+                    if text:
+                        streamed_text += text
+                        on_text(streamed_text)
+                continue
+
+            if mode != "updates":
+                continue
+            interrupts = data.get("__interrupt__")
+            if interrupts:
+                request = getattr(interrupts[0], "value", interrupts[0])
+                return ChannelRunOutcome(
+                    final_message=None,
+                    interrupt_request=request if isinstance(request, dict) else {},
+                )
+
+            for node_name, update in data.items():
+                if node_name == "classify_tool_calls":
+                    tool_calls = _channel_tool_calls_from_classification(update)
+                    if tool_calls:
+                        on_tool_calls(tool_calls)
+                for message in update.get("messages", []):
+                    if isinstance(message, AIMessage):
+                        final_message = message
+
+    if final_message is None:
+        raise RuntimeError("图执行结束，但没有得到 AIMessage。")
+    final_text = _extract_stream_text(final_message)
+    if final_text and final_text != streamed_text:
+        on_text(final_text)
+    return ChannelRunOutcome(final_message=final_message, interrupt_request=None)
+
+
+def _channel_tool_calls_from_classification(
+    update: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """提取渠道可展示的工具调用概要。
+
+    Description:
+        从分类节点更新中转换自动执行和待审批工具，按模型发起调用的原顺序输出
+        工具 ID、名称、审批属性和适合用户查看的调用摘要，不展示执行结果。
+    Args:
+        update (dict[str, Any]): `classify_tool_calls` 节点产生的状态增量。
+    Returns:
+        list[dict[str, Any]]: 可写入交互卡片工具列表的概要条目。
+    """
+    calls_by_id = {
+        call.get("id"): {
+            "id": call.get("id"),
+            "name": call.get("name"),
+            "approval_required": False,
+            "display_content": _format_channel_tool_display_content(call),
+        }
+        for call in update.get("approved_tool_calls", [])
+    }
+    calls_by_id.update(
+        {
+            approval.get("tool_call_id"): {
+                "id": approval.get("tool_call_id"),
+                "name": approval.get("tool_name"),
+                "approval_required": True,
+                "display_content": _format_channel_tool_display_content(
+                    {
+                        "name": approval.get("tool_name"),
+                        "args": approval.get("args") or {},
+                    }
+                ),
+            }
+            for approval in update.get("pending_approvals", [])
+        }
+    )
+    ordered_calls = []
+    seen_ids: set[str] = set()
+    for entry in update.get("tool_audit_log", []):
+        tool_call_id = entry.get("tool_call_id")
+        if tool_call_id in calls_by_id and tool_call_id not in seen_ids:
+            ordered_calls.append(calls_by_id[tool_call_id])
+            seen_ids.add(tool_call_id)
+    ordered_calls.extend(
+        call for call_id, call in calls_by_id.items() if call_id not in seen_ids
+    )
+    return ordered_calls
+
+
+def _format_channel_tool_display_content(tool_call: dict[str, Any]) -> str:
+    """格式化飞书卡片可见的工具调用内容。
+
+    Description:
+        为用户提供执行动作的必要上下文；命令工具以代码块展示具体命令，
+        文件工具只展示目标路径，避免将待写入正文或工具输出泄露到卡片。
+    Args:
+        tool_call (dict[str, Any]): 包含工具名称和调用参数的工具调用对象。
+    Returns:
+        str: 可直接嵌入 CardKit markdown 元素的调用说明文本。
+    """
+    tool_name = str(tool_call.get("name") or "")
+    args = tool_call.get("args") or {}
+    if tool_name == "bash":
+        command = str(args.get("command") or "").replace("```", "``\\`")
+        return f"执行命令：\n```bash\n{command}\n```" if command else ""
+    for key in ("file_path", "path", "dir_path"):
+        value = args.get(key)
+        if isinstance(value, str) and value:
+            return f"目标路径：`{value}`"
+    query = args.get("query")
+    if isinstance(query, str) and query:
+        return f"查询：`{query}`"
+    expression = args.get("expression")
+    if isinstance(expression, str) and expression:
+        return f"表达式：`{expression}`"
+    return ""
 
 
 def _invoke_graph(

@@ -58,6 +58,10 @@ class Config:
         os.getenv("FEISHU_CARD_UPDATE_INTERVAL_MS", "250")
     )
     FEISHU_WORKER_COUNT = int(os.getenv("FEISHU_WORKER_COUNT", "4"))
+    FEISHU_APPROVAL_DB_PATH = os.getenv(
+        "FEISHU_APPROVAL_DB_PATH",
+        "data/feishu_approvals.sqlite",
+    )
 
     REACT_PROMPT_ID = os.getenv(
         "LANGRAPH_REACT_PROMPT_ID",
