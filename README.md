@@ -23,6 +23,7 @@ START -> llm -> tools? -> llm -> ... -> END
 langraph_agent/
 ├── cli.py                 # 命令行参数、.env 加载、入口调度
 ├── config.py              # 默认模型、项目路径、超时和输出限制等配置
+├── feishu_bot.py          # 飞书长连接事件、CardKit 流式卡片回复
 ├── graph.py               # LangGraph ReAct 图、多轮对话、debug 输出
 ├── llm.py                 # ChatOpenAI / OpenAI-compatible 接口初始化
 ├── models.py              # 项目内共享数据结构
@@ -83,6 +84,11 @@ LANGRAPH_COMPACT_TOKEN_THRESHOLD=8000
 LANGRAPH_RECENT_MESSAGES_TO_KEEP=8
 LANGRAPH_COMMAND_TIMEOUT_SECONDS=30
 LANGRAPH_OUTPUT_LIMIT=8000
+FEISHU_APP_ID=你的飞书应用 App ID
+FEISHU_APP_SECRET=你的飞书应用 App Secret
+FEISHU_BASE_URL=https://open.feishu.cn
+FEISHU_CARD_UPDATE_INTERVAL_MS=250
+FEISHU_WORKER_COUNT=4
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=你的 LangSmith API Key
 LANGSMITH_PROJECT=langraph-agent-dev
@@ -194,6 +200,37 @@ uv run python react_agent.py --chat --thread-id study-session-1
 ```text
 exit
 ```
+
+## 飞书应用机器人
+
+项目通过飞书官方 Python SDK 的长连接订阅事件，不需要部署公网回调地址。用户在工作台打开机器人单聊并发送文本后，处理链路如下：
+
+1. 长连接接收 `im.message.receive_v1`，回调立即把任务投递到后台线程。
+2. `chat_id` 映射为 LangGraph `thread_id`（格式为 `feishu:<chat_id>`），因此同一单聊自动复用 checkpoint 多轮历史。
+3. 机器人创建启用了 `streaming_mode` 的 CardKit JSON 2.0 卡片实体，并以卡片消息发送给当前会话。
+4. 模型的流式 token 累积为完整正文，按 `FEISHU_CARD_UPDATE_INTERVAL_MS` 节流更新卡片 markdown 元素，生成结束后关闭流式状态。
+
+在飞书开放平台应用后台完成以下配置：
+
+- 将事件订阅的接收方式设置为“使用长连接接收事件”。
+- 订阅事件 `im.message.receive_v1`。已开通的 `im.chat.access_event.bot_p2p_chat_entered_v1` 和 `p2p_chat_create` 可保留，但回答流程不依赖它们。
+- 开通 `im:message:send_as_bot`、`im:message`、`cardkit:card:write` 权限，并发布可供测试用户使用的应用版本。
+
+把应用凭证写入本地 `.env`，不要提交凭证到 Git：
+
+```bash
+FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
+FEISHU_APP_SECRET=你的应用密钥
+```
+
+安装依赖并启动机器人：
+
+```bash
+uv sync
+uv run feishu-agent
+```
+
+当前飞书入口只处理单聊文本消息。对需要 CLI 人工批准的高风险工具调用，飞书渠道会自动拒绝工具执行，再由模型继续给出不依赖该操作的说明或回答，避免对话 checkpoint 悬空。
 
 查看当前扫描到的 Skill 元数据：
 

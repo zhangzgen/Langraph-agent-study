@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from langchain_core.messages import (
@@ -407,6 +408,73 @@ def chat(
             )
             if not debug and not stream_output:
                 print(f"\n助手: {final_message.content}")
+
+
+def stream_answer(
+    question: str,
+    thread_id: str,
+    on_text: Callable[[str], None],
+    checkpoint_db_path: str | Path | None = None,
+) -> AIMessage:
+    """以回调方式流式运行一轮多轮对话。
+
+    Description:
+        为非终端渠道运行 LangGraph 对话，复用指定 thread_id 的 checkpoint
+        历史，并在模型正文增长时向调用方回传累计文本。
+    Args:
+        question (str): 当前轮用户输入的问题。
+        thread_id (str): 用于复用多轮对话历史的会话标识。
+        on_text (Callable[[str], None]): 接收累计回答正文的回调函数。
+        checkpoint_db_path (str | Path | None): SQLite checkpoint 路径覆盖值。
+    Returns:
+        AIMessage: 当前轮图执行结束后的最终 AI 消息。
+    """
+    inputs = {"messages": [{"role": "user", "content": question}]}
+    graph_config = {"configurable": {"thread_id": thread_id}}
+    final_message: AIMessage | None = None
+    streamed_text = ""
+
+    with checkpoint_saver(checkpoint_db_path) as checkpointer:
+        graph = build_graph(checkpointer=checkpointer)
+        next_input: dict | Command = inputs
+        while True:
+            interrupted = False
+            for mode, data in graph.stream(
+                next_input,
+                config=graph_config,
+                stream_mode=["messages", "updates"],
+            ):
+                if mode == "messages":
+                    message, metadata = data
+                    if _should_print_stream_message(message, metadata):
+                        text = _extract_stream_text(message)
+                        if text:
+                            streamed_text += text
+                            on_text(streamed_text)
+                    continue
+
+                if mode != "updates":
+                    continue
+
+                if data.get("__interrupt__"):
+                    next_input = Command(resume={"approved": False})
+                    interrupted = True
+                    break
+
+                for update in data.values():
+                    for message in update.get("messages", []):
+                        if isinstance(message, AIMessage):
+                            final_message = message
+            if not interrupted:
+                break
+
+    if final_message is None:
+        raise RuntimeError("图执行结束，但没有得到 AIMessage。")
+
+    final_text = _extract_stream_text(final_message)
+    if final_text and final_text != streamed_text:
+        on_text(final_text)
+    return final_message
 
 
 def _invoke_graph(
