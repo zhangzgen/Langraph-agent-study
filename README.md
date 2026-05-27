@@ -1,19 +1,17 @@
-# LangGraph ReAct Agent Study
+# LangGraph Agent Study
 
-这个项目是一个用于学习、实验和持续升级的 LangGraph Agent 项目。它从手写 ReAct agent 起步，逐步沉淀工具系统、Skill 机制、测试体系、记忆能力、权限控制和工程化结构，目标是不断向更接近工业场景的自主智能体架构对齐。
+这个项目是一个基于 LangGraph 持续演进的 Agent 应用工程。项目从 ReAct 循环起步，但当前已不再只是基础调用示例，而是围绕真实交互场景搭建了可扩展、可审计、可持续运行的 Agent 执行链路。
 
-当前阶段重点放在理解 LangGraph 的 `Node`、`State`、`Edge` 和 ReAct 循环，并把学习过程中的能力拆成可维护、可测试、可扩展的模块：
+当前项目已实现的核心能力包括：
 
-```text
-START -> llm -> tools? -> llm -> ... -> END
-```
+- **多入口交互**：支持 CLI 单轮/多轮流式对话，并接入飞书机器人长连接与 CardKit 流式卡片回复。
+- **计划与执行协作**：提供可选 plan 模式，Agent 可先澄清需求、读取上下文、生成执行计划，并在用户审核通过后进入实际执行。
+- **受控工具调用**：集成文件读写、Shell、联网搜索、时间与计算等工具，将调用拆分为分类、审批和执行阶段；高风险操作支持 CLI 或飞书卡片人工审批与审计记录。
+- **持久会话与上下文管理**：使用 SQLite 或 PostgreSQL checkpoint 保存多轮状态，支持中断后恢复执行；长上下文可自动压缩为摘要并继续注入后续对话。
+- **动态 Skill 扩展**：运行时发现并加载 `skills/` 中的技能说明，使 Agent 能按任务选择专门工作流，而无需将所有能力硬编码进主流程。
+- **提示词与工程化支撑**：提示词支持 LangSmith 远程优先、本地模板回退，并配套配置管理、测试覆盖和渠道侧状态持久化机制。
 
-其中：
-
-- `State`: 使用自定义 `AgentState`，核心字段仍是 `messages`，同时显式记录工具审批状态和审计日志。
-- `llm` node: 调用 OpenAI-compatible 接口，并让模型决定是否调用工具。
-- `tool state machine`: 将工具流程拆成 `classify_tool_calls`、`approval_gate`、`execute_tools` 三个节点。
-- `conditional edge`: 检查上一条 AI 消息里是否有 `tool_calls`。有就进入工具状态机，没有就结束。
+底层执行仍以 LangGraph 状态机为核心：主流程根据模型输出进入工具状态机或结束回答；启用计划模式时会在执行前插入计划生成与人工审核环节；渠道侧遇到敏感工具时可暂停当前 checkpoint，待审批后从同一会话继续运行。
 
 ## 项目结构
 
