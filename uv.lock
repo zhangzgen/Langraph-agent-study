@@ -1116,6 +1116,7 @@ dependencies = [
     { name = "langsmith" },
     { name = "lark-oapi" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "psycopg-pool" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
 ]
@@ -1139,6 +1140,7 @@ requires-dist = [
     { name = "langsmith", specifier = ">=0.8.3" },
     { name = "lark-oapi", specifier = ">=1.6.6" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
+    { name = "psycopg-pool", specifier = ">=3.3.0" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "pyyaml", specifier = ">=6.0.0" },
 ]

@@ -16,6 +16,7 @@ dependencies = [
     "deepagents>=0.6.1",
     "langgraph-checkpoint-postgres>=3.1.0",
     "psycopg[binary]>=3.3.4",
+    "psycopg-pool>=3.3.0",
     "httpx>=0.27.0",
     "lark-oapi>=1.6.6",
 ]

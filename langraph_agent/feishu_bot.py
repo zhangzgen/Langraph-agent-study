@@ -617,6 +617,7 @@ class FeishuBotService:
         self._client = client
         self._answer_streamer = answer_streamer
         self._agent_runner = agent_runner
+        self._owns_approval_store = approval_store is None and answer_streamer is None
         self._approval_store = approval_store or (
             None if answer_streamer is not None else FeishuApprovalStore()
         )
@@ -707,13 +708,16 @@ class FeishuBotService:
         """关闭机器人业务服务持有的资源。
 
         Description:
-            等待后台回答任务结束并关闭复用的飞书 HTTP 客户端。
+            等待后台回答任务结束，关闭服务自身创建的审批连接池以及复用的
+            飞书 HTTP 客户端。
         Args:
             无。
         Returns:
             None: 该方法仅执行资源释放。
         """
         self._executor.shutdown(wait=True)
+        if self._owns_approval_store and self._approval_store is not None:
+            self._approval_store.close()
         self._client.close()
 
     def _claim_message(self, message_id: str) -> bool:

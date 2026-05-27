@@ -58,9 +58,22 @@ class Config:
         os.getenv("FEISHU_CARD_UPDATE_INTERVAL_MS", "250")
     )
     FEISHU_WORKER_COUNT = int(os.getenv("FEISHU_WORKER_COUNT", "4"))
+    FEISHU_APPROVAL_DATABASE_URL = os.getenv(
+        "FEISHU_APPROVAL_DATABASE_URL",
+        CHECKPOINT_DATABASE_URL,
+    )
     FEISHU_APPROVAL_DB_PATH = os.getenv(
         "FEISHU_APPROVAL_DB_PATH",
         "data/feishu_approvals.sqlite",
+    )
+    FEISHU_APPROVAL_POOL_MIN_SIZE = int(
+        os.getenv("FEISHU_APPROVAL_POOL_MIN_SIZE", "1")
+    )
+    FEISHU_APPROVAL_POOL_MAX_SIZE = int(
+        os.getenv("FEISHU_APPROVAL_POOL_MAX_SIZE", str(FEISHU_WORKER_COUNT + 1))
+    )
+    FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS = float(
+        os.getenv("FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS", "3")
     )
 
     REACT_PROMPT_ID = os.getenv(
