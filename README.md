@@ -29,6 +29,7 @@ langraph_agent/
 ├── llm.py                 # ChatOpenAI / OpenAI-compatible 接口初始化
 ├── models.py              # 项目内共享数据结构
 ├── tool_guard.py          # 工具白名单、人工审核和执行器
+├── prompt.py              # LangSmith 优先、本地回退的提示词加载与渲染
 ├── skills/
 │   └── registry.py        # Skill 发现、frontmatter 解析和目录定位
 └── tools/
@@ -37,6 +38,10 @@ langraph_agent/
     ├── shell.py           # bash 工具和命令安全策略
     ├── skill_tools.py     # list_skills、load_skill 工具
     └── web_search.py      # Tavily web_search、web_extract 联网工具
+prompts/
+├── react.txt              # 主执行 Agent 提示词本地回退模板
+├── plan.txt               # plan 模式提示词本地模板
+└── summary.txt            # 会话摘要提示词本地回退模板
 ```
 
 后续扩展时建议：
@@ -94,11 +99,16 @@ FEISHU_APPROVAL_DB_PATH=data/feishu_approvals.sqlite
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=你的 LangSmith API Key
 LANGSMITH_PROJECT=langraph-agent-dev
+LANGRAPH_REACT_PROMPT_ID=langraph-agent-react-system
+LANGRAPH_PLAN_PROMPT_ID=
+LANGRAPH_SUMMARY_PROMPT_ID=langraph-agent-summary
 ```
 
 `OPENAI_*` 表示这里使用的是 OpenAI-compatible 协议配置，不绑定具体供应商。所有运行参数统一由 `langraph_agent/config.py` 中的 `config = Config()` 从环境变量加载并设置默认值，业务代码直接使用 `config.xxx`。thinking 开关统一放在 `config.OPENAI_EXTRA_BODY` 中，当前设置为 `{"thinking": {"type": "disabled"}}`，用于兼容 OpenAI-compatible Chat Completions + LangChain 工具调用链路。
 
-LangSmith 当前只开启 tracing。项目启动时会通过 `python-dotenv` 加载 `.env`，只要 `.env` 中 `LANGSMITH_TRACING=true` 且 API Key 有效，LangGraph/LangChain 调用会自动上报 trace。
+项目启动时会通过 `python-dotenv` 加载 `.env`。只要 `.env` 中 `LANGSMITH_TRACING=true` 且 API Key 有效，LangGraph/LangChain 调用会自动上报 trace。
+
+提示词统一由 `langraph_agent/prompt.py` 加载，文本回退模板维护在项目根目录的 `prompts/` 中。配置对应的 `LANGRAPH_*_PROMPT_ID` 时，会优先使用 LangSmith 模板；远程模板无法加载时回退到同名本地模板。`plan` 默认不配置远程标识，因此保持从 `prompts/plan.txt` 加载；需要远程维护时设置 `LANGRAPH_PLAN_PROMPT_ID` 即可。
 
 ## 运行
 

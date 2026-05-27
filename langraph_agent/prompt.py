@@ -1,17 +1,38 @@
 from __future__ import annotations
 
 from functools import cache
+from typing import Any
 
 from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
 from langsmith import Client
 
 from langraph_agent.config import config
 
 
 @cache
-def pull_prompt(prompt_id: str):
-    """从 LangSmith 拉取指定 prompt，并在当前进程内缓存结果。"""
-    return Client().pull_prompt(prompt_id)
+def load_prompt(prompt_id: str | None, local_filename: str) -> Any:
+    """加载远程优先、支持本地回退的聊天提示词模板。
+
+    Description:
+        当配置了 LangSmith prompt 标识时优先拉取远程模板；远程模板不可用时，
+        从项目根目录的 prompts 文件夹读取对应文本模板，并缓存加载结果。
+    Args:
+        prompt_id (str | None): LangSmith 中的 prompt 标识；为空时跳过远程加载。
+        local_filename (str): prompts 文件夹中的本地模板文件名。
+    Returns:
+        Any: 提供 invoke 方法、可渲染为聊天消息的提示词模板实例。
+    """
+    if prompt_id:
+        try:
+            return Client().pull_prompt(prompt_id)
+        except Exception:
+            pass
+
+    template = (config.PROJECT_ROOT / "prompts" / local_filename).read_text(
+        encoding="utf-8"
+    )
+    return ChatPromptTemplate.from_messages([("system", template)])
 
 
 def build_react_prompt_messages(
@@ -20,11 +41,11 @@ def build_react_prompt_messages(
     session_summary: str | None,
     plan_document: str | None = None,
 ) -> list[BaseMessage]:
-    """渲染主 ReAct Agent 的远程 system prompt 消息。
+    """渲染主 ReAct Agent 的 system prompt 消息。
 
     Description:
-        从 LangSmith 拉取主执行 Agent 的 system prompt，并按需附加会话摘要和
-        已审核通过的执行计划，使执行阶段能沿用计划阶段产物。
+        加载主执行 Agent 的远程优先提示词模板，并按需附加会话摘要和已审核
+        通过的执行计划，使执行阶段能沿用计划阶段产物。
     Args:
         skill_catalog (str): 当前可用 Skill 目录文本。
         session_summary (str | None): 历史会话压缩摘要；为空时不注入。
@@ -35,7 +56,7 @@ def build_react_prompt_messages(
     session_summary_block = (
         f"\n\n当前会话摘要:\n{session_summary}" if session_summary else ""
     )
-    prompt = pull_prompt(config.REACT_PROMPT_ID)
+    prompt = load_prompt(config.REACT_PROMPT_ID, "react.txt")
     messages = prompt.invoke(
         {
             "skill_catalog": skill_catalog,
@@ -63,7 +84,7 @@ def build_plan_prompt_messages(
     """构建 plan 模式前置 ReAct 循环的 system prompt。
 
     Description:
-        生成计划阶段专用的本地 system prompt，要求模型先通过只读文件工具和
+        加载计划阶段的远程优先提示词模板，要求模型先通过只读文件工具和
         ask_human 澄清需求，最后输出给执行 Agent 使用的计划书。
     Args:
         skill_catalog (str): 当前可用 Skill 目录文本，用于辅助模型判断可用能力。
@@ -71,31 +92,16 @@ def build_plan_prompt_messages(
     Returns:
         list[BaseMessage]: 计划阶段模型调用所需的 system prompt 消息列表。
     """
-    summary_block = f"\n\n当前会话摘要:\n{session_summary}" if session_summary else ""
-    return [
-        SystemMessage(
-            content=(
-                "你是计划阶段的 ReAct Agent，只负责在执行前澄清需求并产出计划书。"
-                "你可以调用只读文件工具理解项目，也可以调用 ask_human 向用户提问。"
-                "ask_human 支持选择题和说明题；当任务目标、边界、验收标准或风险点"
-                "不明确时，应优先提问。"
-                "\n\n调用 ask_human 时只能使用以下两种 JSON 格式："
-                '\n1. 选择题: {"choose_list":{"问题一":["选项 A","选项 B"],'
-                '"问题二":["选项 C","选项 D"]}}'
-                '\n2. 说明题: {"question":"需要用户补充说明的问题文本"}'
-                "choose_list 必须是字典，键是问题文本，值是字符串选项列表，"
-                "可以在一次调用中提供一个或多个问题；"
-                "不要同时传 choose_list 和 question。"
-                "\n\n当信息足够时，不要调用工具，直接输出计划书。计划书是给后续"
-                "执行 Agent 看的，不是面向用户的说明文。计划书必须具体写明任务目标、"
-                "相关文件、实施步骤、关键实现细节、验证方式、注意事项。"
-                "禁止建议把少于 5 行的代码片段抽取为函数，保持核心逻辑高内聚。"
-                "\n\n输出计划书时使用标题“执行计划书”，并只输出计划书正文。"
-                f"\n\n可用 Skill:\n{skill_catalog}"
-                f"{summary_block}"
-            )
-        )
-    ]
+    session_summary_block = (
+        f"\n\n当前会话摘要:\n{session_summary}" if session_summary else ""
+    )
+    prompt = load_prompt(config.PLAN_PROMPT_ID, "plan.txt")
+    return prompt.invoke(
+        {
+            "skill_catalog": skill_catalog,
+            "session_summary_block": session_summary_block,
+        }
+    ).to_messages()
 
 
 def build_summary_prompt_messages(
@@ -103,8 +109,17 @@ def build_summary_prompt_messages(
     existing_summary: str,
     messages_for_summary: str,
 ) -> list[BaseMessage]:
-    """渲染会话压缩摘要使用的远程 prompt 消息。"""
-    prompt = pull_prompt(config.SUMMARY_PROMPT_ID)
+    """渲染会话压缩摘要使用的 system prompt 消息。
+
+    Description:
+        加载摘要阶段的远程优先提示词模板，并注入已有摘要与待压缩的消息文本。
+    Args:
+        existing_summary (str): 现有会话摘要；没有历史摘要时由调用方传入占位文本。
+        messages_for_summary (str): 本轮需要压缩到摘要中的历史消息文本。
+    Returns:
+        list[BaseMessage]: 摘要模型调用所需的提示词消息列表。
+    """
+    prompt = load_prompt(config.SUMMARY_PROMPT_ID, "summary.txt")
     return prompt.invoke(
         {
             "existing_summary": existing_summary,

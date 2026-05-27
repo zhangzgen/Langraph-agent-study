@@ -67,6 +67,7 @@ class Config:
         "LANGRAPH_REACT_PROMPT_ID",
         "langraph-agent-react-system",
     )
+    PLAN_PROMPT_ID = os.getenv("LANGRAPH_PLAN_PROMPT_ID", "")
     SUMMARY_PROMPT_ID = os.getenv(
         "LANGRAPH_SUMMARY_PROMPT_ID",
         "langraph-agent-summary",
