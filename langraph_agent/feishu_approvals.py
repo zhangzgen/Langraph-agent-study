@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
+from psycopg import Connection, OperationalError
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool, PoolTimeout
+
 from langraph_agent.config import config
 
+
+LOGGER = logging.getLogger(__name__)
 
 SessionStatus = Literal[
     "generating",
@@ -58,24 +67,97 @@ def resolve_approval_db_path(db_path: str | Path | None = None) -> Path:
     return path if path.is_absolute() else config.PROJECT_ROOT / path
 
 
+def resolve_approval_database_url(database_url: str | None = None) -> str | None:
+    """解析飞书审批使用的 PostgreSQL 连接串。
+
+    Description:
+        优先使用显式覆盖值，否则读取审批专用连接串配置。专用配置在未通过
+        环境变量声明时由全局配置沿用 checkpoint PostgreSQL 地址。
+    Args:
+        database_url (str | None): 可选的审批 PostgreSQL 连接串覆盖值。
+    Returns:
+        str | None: 去除空白后的 PostgreSQL 连接串；配置为空时返回 None。
+    """
+    raw_url = (
+        database_url
+        if database_url is not None
+        else config.FEISHU_APPROVAL_DATABASE_URL
+    )
+    stripped_url = raw_url.strip() if raw_url else ""
+    return stripped_url or None
+
+
 class FeishuApprovalStore:
     """持久化保存飞书卡片审批会话及按钮幂等状态。"""
 
-    def __init__(self, db_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        database_url: str | None = None,
+    ) -> None:
         """初始化审批存储并创建数据表。
 
         Description:
-            创建独立 SQLite 文件用于保存卡片会话、展示的工具调用以及已处理动作，
-            从而支持进程重启后的审批恢复与重复点击过滤。
+            默认尝试使用池化 PostgreSQL 保存卡片会话、工具调用与已处理动作；
+            未配置数据库或启动时连接不可用时回退到原有 SQLite 文件。显式提供
+            SQLite 路径时直接选择 SQLite，便于测试和本地独立运行。
         Args:
             db_path (str | Path | None): 可选的审批数据库文件路径。
+            database_url (str | None): 可选的 PostgreSQL 连接串覆盖值。
         Returns:
             None: 初始化仅建立持久化结构。
         """
         self._path = resolve_approval_db_path(db_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._pool: ConnectionPool | None = None
+        resolved_url = resolve_approval_database_url(database_url)
+        if resolved_url is not None and (db_path is None or database_url is not None):
+            pool = ConnectionPool(
+                resolved_url,
+                kwargs={"row_factory": dict_row},
+                min_size=min(
+                    max(config.FEISHU_APPROVAL_POOL_MIN_SIZE, 0),
+                    max(config.FEISHU_APPROVAL_POOL_MAX_SIZE, 1),
+                ),
+                max_size=max(config.FEISHU_APPROVAL_POOL_MAX_SIZE, 1),
+                timeout=max(config.FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS, 0.1),
+                reconnect_timeout=max(config.FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS, 0.1),
+                open=False,
+                name="feishu-approvals",
+            )
+            try:
+                pool.open(
+                    wait=True,
+                    timeout=max(config.FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS, 0.1),
+                )
+            except (OperationalError, PoolTimeout):
+                pool.close()
+                LOGGER.warning("飞书审批 PostgreSQL 启动连接失败，将回退到 SQLite。")
+            else:
+                self._pool = pool
+                try:
+                    self._setup_postgres()
+                except Exception:
+                    self.close()
+                    raise
+                return
+        self._setup_sqlite()
+
+    def _setup_sqlite(self) -> None:
+        """初始化 SQLite 回退存储结构。
+
+        Description:
+            创建兼容原实现的数据表，并启用 WAL 与合理等待时间以降低本地并发
+            流式更新和按钮动作之间的写锁冲突。
+        Args:
+            无。
+        Returns:
+            None: 初始化完成后 SQLite 后端可接受审批读写。
+        """
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS feishu_card_sessions (
@@ -115,6 +197,10 @@ class FeishuApprovalStore:
                     decision TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE INDEX IF NOT EXISTS idx_feishu_active_sessions_chat
+                    ON feishu_card_sessions(chat_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_feishu_tool_card_status_order
+                    ON feishu_tool_approvals(card_id, status, display_order);
                 """
             )
             columns = {
@@ -137,6 +223,114 @@ class FeishuApprovalStore:
                 """
             )
 
+    def _setup_postgres(self) -> None:
+        """初始化 PostgreSQL 审批存储结构。
+
+        Description:
+            在连接池已预热后建立审批、内容块和幂等事件表及查询索引，并兼容
+            已部署过的缺少展示内容字段的旧表结构。
+        Args:
+            无。
+        Returns:
+            None: 初始化完成后 PostgreSQL 后端可接受审批读写。
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feishu_card_sessions (
+                    card_id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    answer_text TEXT NOT NULL DEFAULT '',
+                    sequence INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feishu_tool_approvals (
+                    card_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    approval_required INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    display_content TEXT NOT NULL DEFAULT '',
+                    display_order INTEGER NOT NULL,
+                    PRIMARY KEY (card_id, tool_call_id),
+                    FOREIGN KEY (card_id) REFERENCES feishu_card_sessions(card_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feishu_card_blocks (
+                    block_id BIGSERIAL PRIMARY KEY,
+                    card_id TEXT NOT NULL,
+                    block_type TEXT NOT NULL,
+                    content TEXT NOT NULL DEFAULT '',
+                    tool_call_id TEXT,
+                    UNIQUE (card_id, tool_call_id),
+                    FOREIGN KEY (card_id) REFERENCES feishu_card_sessions(card_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feishu_action_events (
+                    action_key TEXT PRIMARY KEY,
+                    card_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                ALTER TABLE feishu_tool_approvals
+                ADD COLUMN IF NOT EXISTS display_content TEXT NOT NULL DEFAULT ''
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_feishu_active_sessions_chat
+                ON feishu_card_sessions(chat_id, created_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_feishu_tool_card_status_order
+                ON feishu_tool_approvals(card_id, status, display_order)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO feishu_card_blocks(card_id, block_type, tool_call_id)
+                SELECT card_id, 'tool', tool_call_id
+                FROM feishu_tool_approvals
+                ORDER BY card_id, display_order
+                ON CONFLICT (card_id, tool_call_id) DO NOTHING
+                """
+            )
+
+    def close(self) -> None:
+        """关闭审批存储持有的 PostgreSQL 连接池。
+
+        Description:
+            服务退出时释放已建立的 PostgreSQL 连接；SQLite 短连接后端无需额外
+            资源释放，因此该操作对 SQLite 为无副作用调用。
+        Args:
+            无。
+        Returns:
+            None: 已存在的数据库连接资源在返回前完成释放。
+        """
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
+
     def create_session(self, card_id: str, chat_id: str, thread_id: str) -> CardSession:
         """创建一张回答卡片对应的会话记录。
 
@@ -149,8 +343,9 @@ class FeishuApprovalStore:
         Returns:
             CardSession: 新创建的生成中会话状态。
         """
-        with self._lock, self._connect() as conn:
-            conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            self._execute(
+                conn,
                 """
                 INSERT INTO feishu_card_sessions(card_id, chat_id, thread_id, status)
                 VALUES (?, ?, ?, 'generating')
@@ -169,8 +364,9 @@ class FeishuApprovalStore:
         Returns:
             CardSession: 与卡片关联的当前状态。
         """
-        with self._lock, self._connect() as conn:
-            row = conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            row = self._execute(
+                conn,
                 """
                 SELECT card_id, chat_id, thread_id, status, answer_text, sequence
                 FROM feishu_card_sessions WHERE card_id = ?
@@ -198,8 +394,9 @@ class FeishuApprovalStore:
         Returns:
             CardSession | None: 最近的活动会话；不存在时返回 None。
         """
-        with self._lock, self._connect() as conn:
-            row = conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            row = self._execute(
+                conn,
                 """
                 SELECT card_id FROM feishu_card_sessions
                 WHERE chat_id = ? AND status IN ('generating', 'pending_approval', 'executing')
@@ -220,8 +417,9 @@ class FeishuApprovalStore:
         Returns:
             list[CardSession]: 可继续恢复执行的持久化卡片会话列表。
         """
-        with self._lock, self._connect() as conn:
-            rows = conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            rows = self._execute(
+                conn,
                 """
                 SELECT s.card_id
                 FROM feishu_card_sessions s
@@ -261,8 +459,9 @@ class FeishuApprovalStore:
         Returns:
             list[CardSession]: 应被收敛为失败状态的持久化卡片会话列表。
         """
-        with self._lock, self._connect() as conn:
-            rows = conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            rows = self._execute(
+                conn,
                 """
                 SELECT s.card_id
                 FROM feishu_card_sessions s
@@ -305,8 +504,9 @@ class FeishuApprovalStore:
         Returns:
             None: 状态通过数据库持久化。
         """
-        with self._lock, self._connect() as conn:
-            conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            self._execute(
+                conn,
                 """
                 UPDATE feishu_card_sessions
                 SET answer_text = ?, updated_at = CURRENT_TIMESTAMP
@@ -327,15 +527,17 @@ class FeishuApprovalStore:
         Returns:
             int: 新建内容块的数据库标识。
         """
-        with self._lock, self._connect() as conn:
-            cursor = conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            row = self._execute(
+                conn,
                 """
                 INSERT INTO feishu_card_blocks(card_id, block_type, content)
                 VALUES (?, 'text', ?)
+                RETURNING block_id
                 """,
                 (card_id, content),
-            )
-        return int(cursor.lastrowid)
+            ).fetchone()
+        return int(row["block_id"])
 
     def update_text_block(self, block_id: int, content: str) -> None:
         """更新正在流式生成的文本块。
@@ -348,8 +550,9 @@ class FeishuApprovalStore:
         Returns:
             None: 更新内容持久化到卡片时间线。
         """
-        with self._lock, self._connect() as conn:
-            conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            self._execute(
+                conn,
                 "UPDATE feishu_card_blocks SET content = ? WHERE block_id = ?",
                 (content, block_id),
             )
@@ -364,8 +567,9 @@ class FeishuApprovalStore:
         Returns:
             list[CardContentBlock]: 按创建先后排列的卡片内容块列表。
         """
-        with self._lock, self._connect() as conn:
-            rows = conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            rows = self._execute(
+                conn,
                 """
                 SELECT block_id, block_type, content, tool_call_id
                 FROM feishu_card_blocks WHERE card_id = ? ORDER BY block_id
@@ -393,8 +597,9 @@ class FeishuApprovalStore:
         Returns:
             None: 状态通过数据库持久化。
         """
-        with self._lock, self._connect() as conn:
-            conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            self._execute(
+                conn,
                 """
                 UPDATE feishu_card_sessions
                 SET status = ?, updated_at = CURRENT_TIMESTAMP
@@ -413,17 +618,15 @@ class FeishuApprovalStore:
         Returns:
             int: 本次远端卡片更新应使用的新序号。
         """
-        with self._lock, self._connect() as conn:
-            conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            row = self._execute(
+                conn,
                 """
                 UPDATE feishu_card_sessions
                 SET sequence = sequence + 1, updated_at = CURRENT_TIMESTAMP
                 WHERE card_id = ?
+                RETURNING sequence
                 """,
-                (card_id,),
-            )
-            row = conn.execute(
-                "SELECT sequence FROM feishu_card_sessions WHERE card_id = ?",
                 (card_id,),
             ).fetchone()
         if row is None:
@@ -441,22 +644,28 @@ class FeishuApprovalStore:
         Returns:
             None: 工具展示状态通过数据库持久化。
         """
-        with self._lock, self._connect() as conn:
-            current_count = conn.execute(
-                "SELECT COUNT(*) FROM feishu_tool_approvals WHERE card_id = ?",
+        with self._operation_lock(), self._connect() as conn:
+            current_count = self._execute(
+                conn,
+                """
+                SELECT COUNT(*) AS item_count
+                FROM feishu_tool_approvals WHERE card_id = ?
+                """,
                 (card_id,),
-            ).fetchone()[0]
+            ).fetchone()["item_count"]
             for offset, tool_call in enumerate(tool_calls, start=1):
                 tool_call_id = str(tool_call.get("id") or tool_call.get("name") or "")
                 tool_name = str(tool_call.get("name") or "")
                 approval_required = bool(tool_call.get("approval_required"))
                 initial_status = "pending" if approval_required else "auto_approved"
-                conn.execute(
+                self._execute(
+                    conn,
                     """
-                    INSERT OR IGNORE INTO feishu_tool_approvals(
+                    INSERT INTO feishu_tool_approvals(
                         card_id, tool_call_id, tool_name, approval_required,
                         status, display_content, display_order
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (card_id, tool_call_id) DO NOTHING
                     """,
                     (
                         card_id,
@@ -468,11 +677,13 @@ class FeishuApprovalStore:
                         current_count + offset,
                     ),
                 )
-                conn.execute(
+                self._execute(
+                    conn,
                     """
-                    INSERT OR IGNORE INTO feishu_card_blocks(
+                    INSERT INTO feishu_card_blocks(
                         card_id, block_type, tool_call_id
                     ) VALUES (?, 'tool', ?)
+                    ON CONFLICT (card_id, tool_call_id) DO NOTHING
                     """,
                     (card_id, tool_call_id),
                 )
@@ -487,8 +698,9 @@ class FeishuApprovalStore:
         Returns:
             list[DisplayToolCall]: 按出现顺序排列的工具展示条目。
         """
-        with self._lock, self._connect() as conn:
-            rows = conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            rows = self._execute(
+                conn,
                 """
                 SELECT tool_call_id, tool_name, approval_required, status,
                        display_content, display_order
@@ -529,31 +741,38 @@ class FeishuApprovalStore:
         Returns:
             bool: 本次动作首次成功应用时返回 True，否则返回 False。
         """
-        with self._lock, self._connect() as conn:
-            if conn.execute(
+        with self._operation_lock(), self._connect() as conn:
+            if self._execute(
+                conn,
                 "SELECT 1 FROM feishu_action_events WHERE action_key = ?",
                 (action_key,),
             ).fetchone():
                 return False
-            pending = conn.execute(
-                """
+            pending_sql = """
                 SELECT tool_call_id FROM feishu_tool_approvals
                 WHERE card_id = ? AND status = 'pending'
                 ORDER BY display_order LIMIT 1
-                """,
+            """
+            if self._pool is not None:
+                pending_sql += " FOR UPDATE"
+            pending = self._execute(
+                conn,
+                pending_sql,
                 (card_id,),
             ).fetchone()
             if pending is None or pending["tool_call_id"] != tool_call_id:
                 return False
             decision = "approved" if approved else "rejected"
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 UPDATE feishu_tool_approvals SET status = ?
                 WHERE card_id = ? AND tool_call_id = ?
                 """,
                 (decision, card_id, tool_call_id),
             )
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 INSERT INTO feishu_action_events(action_key, card_id, tool_call_id, decision)
                 VALUES (?, ?, ?, ?)
@@ -578,17 +797,74 @@ class FeishuApprovalStore:
             if item["approval_required"] and item["status"] == "approved"
         ]
 
-    def _connect(self) -> sqlite3.Connection:
-        """创建启用行字段访问的 SQLite 连接。
+    def _operation_lock(self) -> Any:
+        """创建当前后端所需的操作级锁上下文。
 
         Description:
-            为一次短事务创建独立连接，便于后台消息和 action 工作线程安全共享存储。
+            SQLite 依赖进程内锁保持多语句审批事务的顺序；PostgreSQL 通过数据库
+            事务和行锁处理并发，避免串行化不同卡片的交互请求。
         Args:
             无。
         Returns:
-            sqlite3.Connection: 已配置 row_factory 与外键校验的数据库连接。
+            Any: 可作为 `with` 上下文使用的同步互斥或空操作上下文。
         """
-        conn = sqlite3.connect(self._path)
+        return self._lock if self._pool is None else nullcontext()
+
+    def _execute(
+        self,
+        conn: sqlite3.Connection | Connection,
+        statement: str,
+        parameters: tuple[Any, ...] = (),
+    ) -> Any:
+        """执行兼容当前数据库后端的参数化 SQL。
+
+        Description:
+            业务 SQL 使用 SQLite 风格占位符编写；在 PostgreSQL 后端执行时转换为
+            psycopg 参数格式，以保持审批逻辑只有一份实现。
+        Args:
+            conn (sqlite3.Connection | Connection): 当前事务使用的数据库连接。
+            statement (str): 待执行的参数化 SQL 语句。
+            parameters (tuple[Any, ...]): 绑定到 SQL 占位符的参数序列。
+        Returns:
+            Any: 数据库驱动返回的游标对象，可继续读取查询结果。
+        """
+        if self._pool is not None:
+            statement = statement.replace("?", "%s")
+        return conn.execute(statement, parameters)
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection | Connection]:
+        """取得一次短事务使用的数据库连接。
+
+        Description:
+            PostgreSQL 从已预热连接池借用连接并由上下文自动提交或回滚；SQLite
+            则创建启用字典行访问、外键校验和忙等待的短连接。
+        Args:
+            无。
+        Returns:
+            Iterator[sqlite3.Connection | Connection]: 当前操作可使用的事务连接。
+        """
+        if self._pool is not None:
+            with self._pool.connection(
+                timeout=max(config.FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS, 0.1)
+            ) as conn:
+                yield conn
+            return
+
+        conn = sqlite3.connect(
+            self._path,
+            timeout=max(config.FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS, 0.1),
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        conn.execute(
+            f"PRAGMA busy_timeout = {int(max(config.FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS, 0.1) * 1000)}"
+        )
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()

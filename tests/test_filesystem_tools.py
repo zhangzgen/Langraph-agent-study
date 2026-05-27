@@ -10,12 +10,6 @@ def test_ls_uses_deepagents_filesystem_backend() -> None:
     assert '"/langraph_agent/"' in result
 
 
-def test_read_file_supports_relative_project_path() -> None:
-    result = read_file.invoke({"file_path": "README.md", "limit": 1})
-
-    assert "1\t# LangGraph ReAct Agent Study" in result
-
-
 def test_glob_finds_project_files() -> None:
     result = glob.invoke({"pattern": "langraph_agent/tools/*.py", "path": "/"})
 

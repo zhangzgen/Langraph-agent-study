@@ -93,7 +93,11 @@ FEISHU_APP_SECRET=你的飞书应用 App Secret
 FEISHU_BASE_URL=https://open.feishu.cn
 FEISHU_CARD_UPDATE_INTERVAL_MS=250
 FEISHU_WORKER_COUNT=4
+FEISHU_APPROVAL_DATABASE_URL=postgresql://langraph_agent:dev_password@localhost:5432/langraph_agent
 FEISHU_APPROVAL_DB_PATH=data/feishu_approvals.sqlite
+FEISHU_APPROVAL_POOL_MIN_SIZE=1
+FEISHU_APPROVAL_POOL_MAX_SIZE=5
+FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS=3
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=你的 LangSmith API Key
 LANGSMITH_PROJECT=langraph-agent-dev
@@ -220,7 +224,7 @@ exit
 3. 机器人创建启用了 `streaming_mode` 的 CardKit JSON 2.0 卡片实体，并以卡片消息发送给当前会话。
 4. 模型的流式 token 按 `FEISHU_CARD_UPDATE_INTERVAL_MS` 节流更新当前 markdown 内容块；工具调用会按发生位置插入卡片时间线，`bash` 命令使用代码块展示，但不展示工具执行结果。
 5. 需要人工审批时，原卡片关闭 `streaming_mode`，在对应工具块中用分隔线和横向按钮展示当前审批项；多项全部决定后才使用 `Command(resume=...)` 恢复原 checkpoint。
-6. 卡片阶段始终在同一消息内切换为“生成中 -> 待审批 -> 执行中 -> 完成”。映射、审批状态、CardKit `sequence` 和按钮幂等键保存到 `FEISHU_APPROVAL_DB_PATH`。
+6. 卡片阶段始终在同一消息内切换为“生成中 -> 待审批 -> 执行中 -> 完成”。映射、审批状态、CardKit `sequence` 和按钮幂等键默认通过 PostgreSQL 连接池存储；未配置或启动时无法连接 PostgreSQL 时回退到 `FEISHU_APPROVAL_DB_PATH` 指定的 SQLite 文件。
 
 在飞书开放平台应用后台完成以下配置：
 
@@ -233,8 +237,14 @@ exit
 ```bash
 FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
 FEISHU_APP_SECRET=你的应用密钥
+FEISHU_APPROVAL_DATABASE_URL=postgresql://langraph_agent:dev_password@localhost:5432/langraph_agent
 FEISHU_APPROVAL_DB_PATH=data/feishu_approvals.sqlite
+FEISHU_APPROVAL_POOL_MIN_SIZE=1
+FEISHU_APPROVAL_POOL_MAX_SIZE=5
+FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS=3
 ```
+
+未单独设置 `FEISHU_APPROVAL_DATABASE_URL` 时，审批存储会沿用 `LANGRAPH_CHECKPOINT_DATABASE_URL`；将其显式留空可强制使用 SQLite。PostgreSQL 池在机器人启动时预热，默认最大连接数为 `FEISHU_WORKER_COUNT + 1`，为后台回答线程和卡片 action 回调预留连接。只有启动连接失败会回退 SQLite；服务运行后不会在一次审批会话中切换数据库，以保持按钮幂等事务的一致性。
 
 安装依赖并启动机器人：
 
