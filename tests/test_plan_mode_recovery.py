@@ -16,11 +16,11 @@ class AskState(TypedDict):
 
 
 def test_ask_human_multiple_choices_accepts_serialized_dictionary() -> None:
-    """验证一次提问可包含多个由模型序列化的选择题。
+    """验证多道选择题会逐题中断并聚合回答。
 
     Description:
         模拟模型把包含多道问题的 choose_list 作为 JSON 字符串输出，确认工具
-        能恢复为字典并在一次中断中展示所有问题和接收联合回答。
+        能恢复为字典，并按问题顺序逐题中断收集用户选择。
     Args:
         无。
     Returns:
@@ -54,15 +54,24 @@ def test_ask_human_multiple_choices_accepts_serialized_dictionary() -> None:
     config = {"configurable": {"thread_id": "multiple-choice-test"}}
 
     interrupted = graph.invoke({"result": ""}, config=config)
-    request = interrupted["__interrupt__"][0].value
-    resumed = graph.invoke(Command(resume={"answer": "1；2,3"}), config=config)
+    first_request = interrupted["__interrupt__"][0].value
+    second_interrupted = graph.invoke(Command(resume={"answer": "1"}), config=config)
+    second_request = second_interrupted["__interrupt__"][0].value
+    resumed = graph.invoke(Command(resume={"answer": "2"}), config=config)
 
-    assert request["display"] == (
-        "选择版本\n1. 基础版\n2. 增强版\n3. 两个都优化\n\n"
-        "选择方向\n1. 架构\n2. 玩法\n3. 视觉"
+    assert first_request["display"] == "选择版本\n1. 基础版\n2. 增强版\n3. 两个都优化"
+    assert first_request["current"] == 1
+    assert first_request["total"] == 2
+    assert first_request["questions"]["选择版本"] == ["基础版", "增强版", "两个都优化"]
+    assert first_request["questions"]["选择方向"] == ["架构", "玩法", "视觉"]
+    assert second_request["display"] == "选择方向\n1. 架构\n2. 玩法\n3. 视觉"
+    assert second_request["current"] == 2
+    assert second_request["total"] == 2
+    assert second_request["questions"]["选择版本"] == ["基础版", "增强版", "两个都优化"]
+    assert second_request["questions"]["选择方向"] == ["架构", "玩法", "视觉"]
+    assert resumed["result"] == (
+        '{"type": "ask_human_answer", "answer": "选择版本: 基础版；选择方向: 玩法"}'
     )
-    assert request["questions"]["选择方向"] == ["架构", "玩法", "视觉"]
-    assert resumed["result"] == '{"type": "ask_human_answer", "answer": "1；2,3"}'
 
 
 def test_ask_human_validation_error_returns_tool_feedback() -> None:
