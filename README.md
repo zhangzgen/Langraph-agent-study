@@ -9,6 +9,7 @@
 - **受控工具调用**：集成文件读写、Shell、联网搜索、时间与计算等工具，将调用拆分为分类、审批和执行阶段；高风险操作支持 CLI 或飞书卡片人工审批与审计记录。
 - **持久会话与上下文管理**：使用 SQLite 或 PostgreSQL checkpoint 保存多轮状态，支持中断后恢复执行；长上下文可自动压缩为摘要并继续注入后续对话。
 - **动态 Skill 扩展**：运行时发现并加载 `skills/` 中的技能说明，使 Agent 能按任务选择专门工作流，而无需将所有能力硬编码进主流程。
+- **MCP 扩展能力**：通过 `mcp_servers.json` 接入本地或远程 MCP 服务，并由 `langchain-mcp-adapters` 转换为 LangChain tools；外部工具继续复用现有分类、审批和执行链路。
 - **提示词与工程化支撑**：提示词支持 LangSmith 远程优先、本地模板回退，并配套配置管理、测试覆盖和渠道侧状态持久化机制。
 
 底层执行仍以 LangGraph 状态机为核心：主流程根据模型输出进入工具状态机或结束回答；启用计划模式时会在执行前插入计划生成与人工审核环节；渠道侧遇到敏感工具时可暂停当前 checkpoint，待审批后从同一会话继续运行。
@@ -482,10 +483,12 @@ uv run python react_agent.py --debug "使用 python-debug-helper 的 environment
 
 项目会读取根目录 `mcp_servers.json`，用 `MultiServerMCPClient` 把外部 MCP server 暴露为 LangChain tools，并继续走现有 `bind_tools -> tool_guard -> execute_tools` 链路。
 
-当前默认配置包含两个无需账号的 stdio MCP server：
+当前默认配置包含四个无需账号的 MCP server，其中前两个通过本地 stdio 启动，后两个是远程 HTTP 服务：
 
 - `mcp-server-fetch`: 提供 `fetch`，用于抓取网页内容，默认需要人工审批；当前启动参数包含 `--ignore-robots-txt`，避免部分环境无法读取 robots.txt 时直接失败。
 - `mcp-server-time`: 提供 `get_current_time` 和 `convert_time`，已在配置中显式标记为只读安全工具，可自动执行。
+- `DeepWiki`: 远程服务 `https://mcp.deepwiki.com/mcp`，提供公共 GitHub 仓库的文档结构、文档内容读取和仓库问答工具，默认需要人工审批。
+- `Cloudflare Docs`: 远程服务 `https://docs.mcp.cloudflare.com/mcp`，提供 Cloudflare 官方文档搜索和 Pages 到 Workers 迁移指南工具，默认需要人工审批。
 
 审批策略默认保守：MCP 工具不在代码内置白名单里，只有在 `mcp_servers.json` 的 `auto_approve_tools` 中显式列出的工具名才会加入自动执行白名单；敏感路径参数仍会升级为人工审核。
 

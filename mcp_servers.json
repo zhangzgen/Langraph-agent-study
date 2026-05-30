@@ -11,6 +11,18 @@
       "command": "uvx",
       "args": ["mcp-server-time"],
       "auto_approve_tools": ["get_current_time", "convert_time"]
+    },
+    "deepwiki": {
+      "transport": "http",
+      "url": "https://mcp.deepwiki.com/mcp",
+      "description": "Free remote DeepWiki MCP server for public GitHub repository documentation and Q&A.",
+      "auto_approve_tools": []
+    },
+    "cloudflare_docs": {
+      "transport": "http",
+      "url": "https://docs.mcp.cloudflare.com/mcp",
+      "description": "Remote Cloudflare documentation MCP server for up-to-date Cloudflare reference search.",
+      "auto_approve_tools": []
     }
   }
 }
