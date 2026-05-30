@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -8,8 +9,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite import SqliteSaver
+from psycopg import OperationalError
 
 from langraph_agent.config import config
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def resolve_checkpoint_db_path(db_path: str | Path | None = None) -> str | Path:
@@ -125,9 +130,12 @@ def checkpoint_saver(
         Iterator[BaseCheckpointSaver]: 可传给 LangGraph compile 的 checkpointer。
     """
     if resolve_checkpoint_database_url() is not None:
-        with postgres_checkpointer() as checkpointer:
-            yield checkpointer
-        return
+        try:
+            with postgres_checkpointer() as checkpointer:
+                yield checkpointer
+            return
+        except OperationalError:
+            LOGGER.warning("LangGraph checkpoint PostgreSQL 启动连接失败，将回退到 SQLite。")
 
     with sqlite_checkpointer(db_path) as checkpointer:
         yield checkpointer
