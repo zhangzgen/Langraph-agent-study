@@ -48,6 +48,7 @@ prompts/
 后续扩展时建议：
 
 - 新增普通工具：放到 `langraph_agent/tools/` 下的同类文件中，并在 `langraph_agent/tools/__init__.py` 注册到 `TOOLS`。
+- 新增 MCP 工具：改 `mcp_servers.json`，运行时会通过 `langchain-mcp-adapters` 转成 LangChain tools。
 - 新增 Skill：继续放到项目根目录的 `skills/<skill-name>/SKILL.md`，不需要改 Python 代码。
 - 修改模型或 API 默认值：优先改 `langraph_agent/config.py`，运行时差异继续用环境变量覆盖。
 - 修改图结构或多轮记忆行为：集中改 `langraph_agent/graph.py`。
@@ -476,6 +477,17 @@ uv run python react_agent.py --debug "使用 python-debug-helper 的 environment
 ```
 
 如果模型调用 `bash("uv run python skills/python-debug-helper/scripts/environment_report.py")`，CLI 会把该工具调用列为待审核项；批准对应项后才会真正执行。
+
+## MCP 工具
+
+项目会读取根目录 `mcp_servers.json`，用 `MultiServerMCPClient` 把外部 MCP server 暴露为 LangChain tools，并继续走现有 `bind_tools -> tool_guard -> execute_tools` 链路。
+
+当前默认配置包含两个无需账号的 stdio MCP server：
+
+- `mcp-server-fetch`: 提供 `fetch`，用于抓取网页内容，默认需要人工审批；当前启动参数包含 `--ignore-robots-txt`，避免部分环境无法读取 robots.txt 时直接失败。
+- `mcp-server-time`: 提供 `get_current_time` 和 `convert_time`，已在配置中显式标记为只读安全工具，可自动执行。
+
+审批策略默认保守：MCP 工具不在代码内置白名单里，只有在 `mcp_servers.json` 的 `auto_approve_tools` 中显式列出的工具名才会加入自动执行白名单；敏感路径参数仍会升级为人工审核。
 
 ## 注意
 

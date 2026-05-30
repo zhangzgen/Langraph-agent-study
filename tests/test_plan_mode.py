@@ -192,6 +192,8 @@ def test_plan_mode_routes_approved_plan_to_execution(monkeypatch) -> None:
 
     monkeypatch.setattr(graph_module, "build_llm", fake_build_llm)
     monkeypatch.setattr(graph_module, "discover_skills", lambda: [])
+    monkeypatch.setattr(graph_module, "load_mcp_tools_sync", lambda: [])
+    monkeypatch.setattr(graph_module, "get_mcp_auto_approved_tools", lambda: set())
 
     graph = graph_module.build_graph(checkpointer=MemorySaver(), plan_mode=True)
     config = {"configurable": {"thread_id": "plan-test"}}

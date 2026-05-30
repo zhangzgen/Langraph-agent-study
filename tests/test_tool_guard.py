@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from langchain_core.messages import AIMessage
+from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.types import Command
@@ -68,6 +69,47 @@ def test_edit_file_requires_review() -> None:
     assert not tool_guard.should_auto_approve_tool_call(tool_call)
 
 
+def test_mcp_tool_requires_review_by_default() -> None:
+    """验证未显式授权的 MCP 工具默认需要人工审核。
+
+    Description:
+        模拟 MCP fetch 工具调用，确认它不在默认自动审批白名单中时不会自动执行。
+    Args:
+        None: 该测试不接收外部参数。
+    Returns:
+        None: 该测试通过断言验证审批策略。
+    """
+    tool_call = {
+        "id": "call_fetch",
+        "name": "fetch",
+        "args": {"url": "https://example.com"},
+    }
+
+    assert not tool_guard.should_auto_approve_tool_call(tool_call)
+
+
+def test_explicit_safe_mcp_tool_can_be_auto_approved() -> None:
+    """验证配置显式授权的 MCP 工具可以自动审批。
+
+    Description:
+        模拟 time MCP 的只读工具调用，确认传入额外白名单后可沿用自动执行链路。
+    Args:
+        None: 该测试不接收外部参数。
+    Returns:
+        None: 该测试通过断言验证审批策略。
+    """
+    tool_call = {
+        "id": "call_time",
+        "name": "get_current_time",
+        "args": {"timezone": "Asia/Shanghai"},
+    }
+
+    assert tool_guard.should_auto_approve_tool_call(
+        tool_call,
+        auto_approved_tools={"get_current_time"},
+    )
+
+
 def test_normalize_approved_call_ids_supports_approve_all() -> None:
     review_required = [
         {"id": "call_1", "name": "write_file", "args": {}},
@@ -105,6 +147,56 @@ def test_graph_approved_bash_execution_skips_interactive_confirmation(
 
     assert "exit_code: 0" in result
     assert "stdout:\nhello" in result
+
+
+def test_execute_tools_node_supports_async_only_tools() -> None:
+    """验证执行器兼容 MCP 风格异步工具。
+
+    Description:
+        构造只支持 ainvoke 的 StructuredTool，确认运行时工具执行节点会自动切换到异步调用路径。
+    Args:
+        None: 该测试不接收外部参数。
+    Returns:
+        None: 该测试通过断言验证工具执行结果。
+    """
+
+    async def async_echo(text: str) -> str:
+        """返回输入文本。
+
+        Description:
+            模拟 MCP adapter 生成的异步 LangChain 工具。
+        Args:
+            text (str): 需要原样返回的文本。
+        Returns:
+            str: 原始输入文本。
+        """
+        return f"async:{text}"
+
+    async_tool = StructuredTool.from_function(
+        coroutine=async_echo,
+        name="async_echo",
+        description="Echo text asynchronously.",
+    )
+    execute_node = tool_guard.build_execute_tools_node([async_tool])
+
+    result = execute_node(
+        {
+            "messages": [],
+            "approved_tool_calls": [
+                {
+                    "id": "call_async",
+                    "name": "async_echo",
+                    "args": {"text": "ok"},
+                }
+            ],
+            "rejected_tool_calls": [],
+            "pending_approvals": [],
+            "tool_audit_log": [],
+        }
+    )
+
+    assert result["messages"][0].content == "async:ok"
+    assert result["tool_audit_log"][-1]["status"] == "executed"
 
 
 def test_tool_approval_state_machine_interrupts_and_resumes_with_rejection() -> None:

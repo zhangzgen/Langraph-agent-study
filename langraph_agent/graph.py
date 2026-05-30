@@ -33,15 +33,16 @@ from langraph_agent.prompt import build_plan_prompt_messages, build_react_prompt
 from langraph_agent.skills.registry import discover_skills, format_skill_catalog
 from langraph_agent.tool_guard import (
     approval_gate_node,
+    build_classify_tool_calls_node,
+    build_execute_tools_node,
     build_tool_approval_request,
-    classify_tool_calls_node,
-    execute_tools_node,
     has_pending_approvals,
     has_tool_calls,
     normalize_approved_call_ids,
     should_auto_approve_tool_call,
 )
-from langraph_agent.tools import PLAN_TOOLS
+from langraph_agent.tools import PLAN_TOOLS, TOOLS
+from langraph_agent.tools.mcp import get_mcp_auto_approved_tools, load_mcp_tools_sync
 
 
 @dataclass(frozen=True)
@@ -73,7 +74,11 @@ def build_graph(
     Returns:
         CompiledStateGraph: 可 invoke 或 stream 的 LangGraph 编译结果。
     """
-    llm = build_llm()
+    mcp_tools = load_mcp_tools_sync()
+    runtime_tools = [*TOOLS, *mcp_tools]
+    mcp_auto_approved_tools = get_mcp_auto_approved_tools()
+
+    llm = build_llm(tools=runtime_tools)
     plan_llm = build_llm(tools=PLAN_TOOLS) if plan_mode else None
     summary_llm = build_llm(bind_tools=False)
     skill_catalog = format_skill_catalog(discover_skills())
@@ -240,9 +245,12 @@ def build_graph(
         builder.add_node("plan_llm", call_plan_llm)
         builder.add_node("execute_plan_tools", execute_plan_tools)
         builder.add_node("review_plan", review_plan)
-    builder.add_node("classify_tool_calls", classify_tool_calls_node)
+    builder.add_node(
+        "classify_tool_calls",
+        build_classify_tool_calls_node(mcp_auto_approved_tools),
+    )
     builder.add_node("approval_gate", approval_gate_node)
-    builder.add_node("execute_tools", execute_tools_node)
+    builder.add_node("execute_tools", build_execute_tools_node(runtime_tools))
     builder.add_node("summarize_and_compact", summarize_and_compact)
 
     # 图从 START 进入 llm；启用 plan 时先进入计划阶段。

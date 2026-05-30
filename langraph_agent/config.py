@@ -35,6 +35,12 @@ class Config:
     SKILLS_DIR = Path(
         os.getenv("AGENT_SKILLS_DIR", str(PROJECT_ROOT / "skills"))
     ).expanduser()
+    MCP_SERVERS_CONFIG_PATH = Path(
+        os.getenv(
+            "LANGRAPH_MCP_SERVERS_CONFIG_PATH",
+            str(PROJECT_ROOT / "mcp_servers.json"),
+        )
+    ).expanduser()
 
     CHECKPOINT_DB_PATH = os.getenv(
         "LANGRAPH_CHECKPOINT_DB_PATH",

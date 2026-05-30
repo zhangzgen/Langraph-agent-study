@@ -122,11 +122,13 @@ def test_graph_compacts_messages_after_final_high_token_response(monkeypatch) ->
     )
     summary_llm = FakeLLM(AIMessage(content="压缩后的摘要"))
 
-    def fake_build_llm(*, bind_tools: bool = True):
+    def fake_build_llm(*, bind_tools: bool = True, tools=None):
         return agent_llm if bind_tools else summary_llm
 
     monkeypatch.setattr(graph_module, "build_llm", fake_build_llm)
     monkeypatch.setattr(graph_module, "discover_skills", lambda: [])
+    monkeypatch.setattr(graph_module, "load_mcp_tools_sync", lambda: [])
+    monkeypatch.setattr(graph_module, "get_mcp_auto_approved_tools", lambda: set())
 
     graph = graph_module.build_graph(
         compact_token_threshold=50,

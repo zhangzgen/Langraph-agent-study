@@ -1,0 +1,16 @@
+{
+  "servers": {
+    "fetch": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-fetch", "--ignore-robots-txt"],
+      "auto_approve_tools": []
+    },
+    "time": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-time"],
+      "auto_approve_tools": ["get_current_time", "convert_time"]
+    }
+  }
+}
