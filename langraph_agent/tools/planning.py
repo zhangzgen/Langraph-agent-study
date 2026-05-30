@@ -107,9 +107,10 @@ def ask_human(
     """
     try:
         if choose_list:
+            answers: list[tuple[str, str]] = []
             questions = list(choose_list.items())
-            display = "\n\n".join(
-                "\n".join(
+            for question_index, (prompt, options) in enumerate(questions, start=1):
+                display = "\n".join(
                     [
                         prompt,
                         *[
@@ -118,17 +119,39 @@ def ask_human(
                         ],
                     ]
                 )
-                for prompt, options in questions
-            )
-            request: dict[str, object] = {
-                "type": "ask_human",
-                "mode": "choice",
-                "display": display,
-                "questions": choose_list,
-            }
-            if len(questions) == 1:
-                request["options"] = questions[0][1]
-            resume_value = interrupt(request)
+                resume_value = interrupt(
+                    {
+                        "type": "ask_human",
+                        "mode": "choice",
+                        "display": display,
+                        "question": prompt,
+                        "questions": choose_list,
+                        "options": options,
+                        "current": question_index,
+                        "total": len(questions),
+                    }
+                )
+
+                answer = ""
+                if isinstance(resume_value, dict) and isinstance(
+                    resume_value.get("answer"), str
+                ):
+                    answer = resume_value["answer"].strip()
+                elif isinstance(resume_value, str):
+                    answer = resume_value.strip()
+                if answer.isdigit():
+                    index = int(answer)
+                    if 1 <= index <= len(options):
+                        answer = options[index - 1]
+                answers.append((prompt, answer or "用户未提供补充信息。"))
+
+            if len(answers) == 1:
+                answer = answers[0][1]
+            else:
+                answer = "；".join(
+                    f"{prompt}: {selected_answer}"
+                    for prompt, selected_answer in answers
+                )
         else:
             display = question or "请补充说明需求。"
             resume_value = interrupt(
@@ -139,16 +162,13 @@ def ask_human(
                 }
             )
 
-        answer = ""
-        if isinstance(resume_value, dict) and isinstance(resume_value.get("answer"), str):
-            answer = resume_value["answer"].strip()
-        elif isinstance(resume_value, str):
-            answer = resume_value.strip()
-        if choose_list and len(choose_list) == 1 and answer.isdigit():
-            options = next(iter(choose_list.values()))
-            index = int(answer)
-            if 1 <= index <= len(options):
-                answer = options[index - 1]
+            answer = ""
+            if isinstance(resume_value, dict) and isinstance(
+                resume_value.get("answer"), str
+            ):
+                answer = resume_value["answer"].strip()
+            elif isinstance(resume_value, str):
+                answer = resume_value.strip()
         return json.dumps(
             {"type": "ask_human_answer", "answer": answer or "用户未提供补充信息。"},
             ensure_ascii=False,
