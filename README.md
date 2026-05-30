@@ -14,6 +14,87 @@
 
 底层执行仍以 LangGraph 状态机为核心：主流程根据模型输出进入工具状态机或结束回答；启用计划模式时会在执行前插入计划生成与人工审核环节；渠道侧遇到敏感工具时可暂停当前 checkpoint，待审批后从同一会话继续运行。
 
+## 系统架构
+
+整体架构以 LangGraph 状态图为主，CLI 与飞书机器人只是不同的输入/输出渠道；真正的任务编排、工具审批、checkpoint 恢复和上下文压缩都在同一个 Graph 中完成。
+
+```mermaid
+flowchart LR
+    user["用户"]
+    cli["CLI\nreact-agent / react_agent.py"]
+    feishu["飞书机器人\n长连接 + CardKit"]
+    agent_graph["LangGraph AgentState\nmessages / summary / plan / approvals"]
+
+    user --> cli
+    user --> feishu
+    cli --> agent_graph
+    feishu --> agent_graph
+
+    subgraph plan["可选 Plan 子图"]
+        plan_llm["plan_llm\n澄清 / 读取上下文 / 输出计划"]
+        plan_tools["execute_plan_tools\nask_human + 只读文件工具"]
+        review_plan["review_plan\n人工审核计划书"]
+        plan_llm -->|"tool_calls"| plan_tools --> plan_llm
+        plan_llm -->|"无工具调用"| review_plan
+        review_plan -->|"需调整"| plan_llm
+    end
+
+    subgraph react["主 ReAct 执行图"]
+        llm["llm\nOpenAI-compatible Chat Model"]
+        classify["classify_tool_calls\n自动执行 / 待审批分类"]
+        approval["approval_gate\ninterrupt 人工审批"]
+        execute["execute_tools\n执行已批准工具"]
+        compact["summarize_and_compact\n摘要压缩"]
+        end_node["END\n最终回答"]
+
+        llm -->|"tool_calls"| classify
+        classify -->|"有待审批"| approval --> execute
+        classify -->|"全部自动批准"| execute
+        execute --> llm
+        llm -->|"无工具调用且超过阈值"| compact --> end_node
+        llm -->|"无工具调用"| end_node
+    end
+
+    agent_graph -->|"--plan"| plan_llm
+    agent_graph -->|"普通模式"| llm
+    review_plan -->|"审核通过"| llm
+
+    subgraph tools["工具与扩展"]
+        base_tools["基础工具\ncalculator / current_time"]
+        file_tools["文件工具\nls / read_file / grep / glob / write_file / edit_file"]
+        shell_tool["Shell\nbash"]
+        web_tools["联网工具\nweb_search / web_extract"]
+        skill_tools["Skill\nlist_skills / load_skill"]
+        mcp_tools["MCP Tools\nmcp_servers.json"]
+    end
+
+    execute --> base_tools
+    execute --> file_tools
+    execute --> shell_tool
+    execute --> web_tools
+    execute --> skill_tools
+    execute --> mcp_tools
+
+    subgraph storage["持久化与配置"]
+        checkpoint["Checkpoint\nPostgreSQL 优先 / SQLite 回退"]
+        approval_store["飞书审批状态\nPostgreSQL 优先 / SQLite 回退"]
+        prompts["Prompt\nLangSmith 优先 / prompts/ 回退"]
+        env["配置\n.env / 环境变量"]
+    end
+
+    agent_graph <--> checkpoint
+    feishu <--> approval_store
+    llm --> prompts
+    agent_graph --> env
+```
+
+Graph 中的关键边如下：
+
+- `START -> plan_llm -> review_plan -> llm`：只在 CLI 启用 `--plan` 时出现，计划书通过后进入主执行图。
+- `llm -> classify_tool_calls -> approval_gate -> execute_tools -> llm`：主 ReAct 工具循环，高风险工具通过 `interrupt()` 暂停等待人工确认。
+- `llm -> summarize_and_compact -> END`：没有工具调用且 token 超过阈值时压缩历史，再结束当前轮。
+- 渠道侧的 CLI 和飞书都复用同一套 checkpoint 语义；飞书以 `feishu:<chat_id>` 作为 `thread_id`。
+
 ## 项目结构
 
 项目已按职责拆分，`react_agent.py` 只保留兼容入口，核心代码放在 `langraph_agent/` 包里：
@@ -36,6 +117,7 @@ langraph_agent/
 └── tools/
     ├── basic.py           # calculator、current_time 等基础工具
     ├── filesystem.py      # Deep Agents FilesystemBackend 文件工具
+    ├── mcp.py             # mcp_servers.json 加载与 MCP 工具转换
     ├── planning.py        # plan 阶段 ask_human 澄清工具
     ├── shell.py           # bash 工具和命令安全策略
     ├── skill_tools.py     # list_skills、load_skill 工具
@@ -91,6 +173,7 @@ OPENAI_TEMPERATURE=0
 OPENAI_THINKING_TYPE=disabled
 TAVILY_API_KEY=你的 Tavily API Key
 TAVILY_EXTRACT_CONTENT_LIMIT=12000
+LANGRAPH_MCP_SERVERS_CONFIG_PATH=mcp_servers.json
 LANGRAPH_CHECKPOINT_DB_PATH=data/checkpoints.sqlite
 LANGRAPH_CHECKPOINT_DATABASE_URL=postgresql://langraph_agent:dev_password@localhost:5432/langraph_agent
 LANGRAPH_COMPACT_TOKEN_THRESHOLD=8000
@@ -107,7 +190,7 @@ FEISHU_APPROVAL_DB_PATH=data/feishu_approvals.sqlite
 FEISHU_APPROVAL_POOL_MIN_SIZE=1
 FEISHU_APPROVAL_POOL_MAX_SIZE=5
 FEISHU_APPROVAL_POOL_TIMEOUT_SECONDS=3
-LANGSMITH_TRACING=true
+LANGSMITH_TRACING=false
 LANGSMITH_API_KEY=你的 LangSmith API Key
 LANGSMITH_PROJECT=langraph-agent-dev
 LANGRAPH_REACT_PROMPT_ID=langraph-agent-react-system
@@ -125,6 +208,8 @@ FEISHU_APPROVAL_DATABASE_URL=
 ```
 
 常用可选配置还包括：`LANGRAPH_PROJECT_ROOT` 用于修改文件工具的项目根目录，`AGENT_SKILLS_DIR` 用于切换 Skill 扫描目录。测试或临时实验可把 `LANGRAPH_CHECKPOINT_DB_PATH` 设置为 `:memory:` 选择内存 SQLite；`LANGRAPH_SQLITE_IN_MEMORY` 可在需要时修改该标识值。
+
+MCP 配置默认从项目根目录的 `mcp_servers.json` 读取；如需按环境切换外部 MCP server，可设置 `LANGRAPH_MCP_SERVERS_CONFIG_PATH` 指向另一份 JSON 配置。
 
 项目启动时会通过 `python-dotenv` 加载 `.env`。只要 `.env` 中 `LANGSMITH_TRACING=true` 且 API Key 有效，LangGraph/LangChain 调用会自动上报 trace。
 
