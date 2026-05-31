@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from langchain_core.messages import (
@@ -14,6 +15,10 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langraph_agent.config import config
 from langraph_agent.models import AgentState
 from langraph_agent.prompt import build_summary_prompt_messages
+
+TOOL_RESULT_PLACEHOLDER = (
+    "[工具执行结果已超过 KV cache 过期时间，已替换为占位符以压缩上下文。]"
+)
 
 
 def extract_total_tokens(message: BaseMessage) -> int | None:
@@ -52,6 +57,52 @@ def should_compact_context(
 
     total_tokens = state.get("last_total_tokens")
     return isinstance(total_tokens, int) and total_tokens >= token_threshold
+
+
+def should_expire_tool_results(
+    state: AgentState,
+    *,
+    ttl_seconds: int = config.KV_CACHE_TTL_SECONDS,
+    now: float | None = None,
+) -> bool:
+    """判断是否应在下一次模型调用前把工具结果替换为占位符。"""
+    messages = state.get("messages", [])
+    if not messages or not any(isinstance(message, AIMessage) for message in messages):
+        return False
+    if not any(_tool_result_needs_placeholder(message) for message in messages):
+        return False
+
+    last_model_or_turn_at = state.get("last_model_or_turn_at")
+    if not isinstance(last_model_or_turn_at, int | float):
+        return False
+    if ttl_seconds < 0:
+        return False
+
+    current_time = now if now is not None else time.time()
+    return current_time - float(last_model_or_turn_at) >= ttl_seconds
+
+
+def build_tool_result_placeholder_messages(
+    messages: list[BaseMessage],
+    *,
+    placeholder: str = TOOL_RESULT_PLACEHOLDER,
+) -> list[BaseMessage]:
+    """构造用于替换全部 ToolMessage 内容的 messages 状态更新。"""
+    rewritten_messages = [
+        message.model_copy(update={"content": placeholder})
+        if isinstance(message, ToolMessage)
+        else message
+        for message in messages
+    ]
+    return [
+        RemoveMessage(id=REMOVE_ALL_MESSAGES, content=""),
+        *rewritten_messages,
+    ]
+
+
+def count_tool_results_to_placeholder(messages: list[BaseMessage]) -> int:
+    """统计仍包含真实结果、需要替换的工具消息数量。"""
+    return sum(1 for message in messages if _tool_result_needs_placeholder(message))
 
 
 def build_compacted_messages(
@@ -126,3 +177,10 @@ def _message_content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     return repr(content)
+
+
+def _tool_result_needs_placeholder(message: BaseMessage) -> bool:
+    return (
+        isinstance(message, ToolMessage)
+        and message.content != TOOL_RESULT_PLACEHOLDER
+    )

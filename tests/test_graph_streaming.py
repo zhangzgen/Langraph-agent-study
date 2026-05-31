@@ -61,6 +61,19 @@ def test_stream_graph_to_console_prints_prefix_with_first_chunk(capsys):
     assert capsys.readouterr().out == "assistant: hello\n"
 
 
+class FakeNoopUpdateGraph:
+    def stream(self, next_input, config, stream_mode):
+        assert next_input == {"messages": [{"role": "user", "content": "hi"}]}
+        assert config == {"configurable": {"thread_id": "test"}}
+        assert stream_mode == ["messages", "updates"]
+        yield ("updates", {"expire_tool_results": None})
+        yield (
+            "messages",
+            (AIMessageChunk(content="ok"), {"langgraph_node": "llm"}),
+        )
+        yield ("updates", {"llm": {"messages": [AIMessage(content="ok")]}})
+
+
 class FakeNonChunkGraph:
     def stream(self, next_input, config, stream_mode):
         yield ("updates", {"llm": {"messages": [AIMessage(content="fallback")]}})
@@ -144,6 +157,31 @@ class FakeChannelPauseGraph:
             }
 
         yield ("updates", {"__interrupt__": [InterruptItem()]})
+
+
+def test_stream_graph_to_console_skips_noop_node_update(capsys):
+    final_message = _stream_graph_to_console(
+        FakeNoopUpdateGraph(),
+        {"messages": [{"role": "user", "content": "hi"}]},
+        config={"configurable": {"thread_id": "test"}},
+    )
+
+    assert final_message.content == "ok"
+    assert capsys.readouterr().out == "ok\n"
+
+
+def test_stream_debug_graph_to_console_skips_noop_node_update(capsys):
+    final_message = _stream_debug_graph_to_console(
+        FakeNoopUpdateGraph(),
+        {"messages": [{"role": "user", "content": "hi"}]},
+        config={"configurable": {"thread_id": "test"}},
+    )
+
+    output = capsys.readouterr().out
+    assert final_message.content == "ok"
+    assert "[expire_tool_results]" in output
+    assert "[llm]" in output
+    assert "content: <streamed above>" in output
 
 
 def test_stream_graph_to_console_falls_back_to_final_message(capsys):

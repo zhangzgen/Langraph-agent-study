@@ -53,6 +53,11 @@ class Config:
         os.getenv("LANGRAPH_COMPACT_TOKEN_THRESHOLD", "8000")
     )
     RECENT_MESSAGES_TO_KEEP = int(os.getenv("LANGRAPH_RECENT_MESSAGES_TO_KEEP", "8"))
+    TOOL_RESULT_COMPACTION_ENABLED = os.getenv(
+        "LANGRAPH_TOOL_RESULT_COMPACTION_ENABLED",
+        "true",
+    ).lower() in {"1", "true", "yes", "on"}
+    KV_CACHE_TTL_SECONDS = int(os.getenv("LANGRAPH_KV_CACHE_TTL_SECONDS", "300"))
 
     COMMAND_TIMEOUT_SECONDS = int(os.getenv("LANGRAPH_COMMAND_TIMEOUT_SECONDS", "30"))
     OUTPUT_LIMIT = int(os.getenv("LANGRAPH_OUTPUT_LIMIT", "8000"))

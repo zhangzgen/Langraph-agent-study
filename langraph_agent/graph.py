@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -24,8 +25,11 @@ from langraph_agent.config import config
 from langraph_agent.context import (
     build_compacted_messages,
     build_summary_prompt,
+    build_tool_result_placeholder_messages,
+    count_tool_results_to_placeholder,
     extract_total_tokens,
     should_compact_context,
+    should_expire_tool_results,
 )
 from langraph_agent.llm import build_llm
 from langraph_agent.models import AgentState
@@ -58,6 +62,8 @@ def build_graph(
     checkpointer: BaseCheckpointSaver | None = None,
     compact_token_threshold: int = config.COMPACT_TOKEN_THRESHOLD,
     recent_messages_to_keep: int = config.RECENT_MESSAGES_TO_KEEP,
+    tool_result_compaction_enabled: bool = config.TOOL_RESULT_COMPACTION_ENABLED,
+    kv_cache_ttl_seconds: int = config.KV_CACHE_TTL_SECONDS,
     plan_mode: bool = False,
 ):
     """构建 LangGraph ReAct 状态机，并按需启用 checkpointer。
@@ -70,6 +76,8 @@ def build_graph(
         checkpointer (BaseCheckpointSaver | None): 外部传入的 LangGraph checkpoint 实例。
         compact_token_threshold (int): 触发上下文压缩的 token 阈值。
         recent_messages_to_keep (int): 上下文压缩后保留的最近消息数量。
+        tool_result_compaction_enabled (bool): 是否启用工具结果占位压缩。
+        kv_cache_ttl_seconds (int): 工具结果按 KV cache 过期时间替换占位符的秒数。
         plan_mode (bool): 是否启用执行前计划模式。
     Returns:
         CompiledStateGraph: 可 invoke 或 stream 的 LangGraph 编译结果。
@@ -93,7 +101,10 @@ def build_graph(
         # 这里是 ReAct 中的“Reason/Act 决策”阶段：
         # 模型读取用户问题和历史消息，决定直接回答，还是返回 tool_calls。
         response = llm.invoke([*prompt_messages, *state["messages"]])
-        update: dict[str, object] = {"messages": [response]}
+        update: dict[str, object] = {
+            "messages": [response],
+            "last_model_or_turn_at": time.time(),
+        }
         total_tokens = extract_total_tokens(response)
         if total_tokens is not None:
             update["last_total_tokens"] = total_tokens
@@ -117,7 +128,11 @@ def build_graph(
             session_summary=state.get("session_summary"),
         )
         response = plan_llm.invoke([*prompt_messages, *state["messages"]])
-        update: dict[str, object] = {"messages": [response]}
+        update: dict[str, object] = {
+            "messages": [response],
+            "last_model_or_turn_at": time.time(),
+            "plan_approved": False,
+        }
         total_tokens = extract_total_tokens(response)
         if total_tokens is not None:
             update["last_total_tokens"] = total_tokens
@@ -235,11 +250,34 @@ def build_graph(
             },
         }
 
+    def expire_tool_results(state: AgentState) -> dict[str, object]:
+        """在下一次模型调用前把过期工具结果替换为占位符。"""
+        if not tool_result_compaction_enabled:
+            return {}
+        if not should_expire_tool_results(
+            state,
+            ttl_seconds=kv_cache_ttl_seconds,
+            now=time.time(),
+        ):
+            return {}
+
+        replaced_count = count_tool_results_to_placeholder(state["messages"])
+        return {
+            "messages": build_tool_result_placeholder_messages(state["messages"]),
+            "tool_result_compaction": {
+                "replaced_count": replaced_count,
+                "message_count": len(state["messages"]),
+                "kv_cache_ttl_seconds": kv_cache_ttl_seconds,
+                "last_model_or_turn_at": state.get("last_model_or_turn_at"),
+            },
+        }
+
     # StateGraph 定义“状态如何在节点之间流动”。
     # 这里把工具执行拆成三段，方便观察和扩展审批状态。
     builder = StateGraph(AgentState)
 
     # llm 节点：负责调用模型，让模型判断下一步。
+    builder.add_node("expire_tool_results", expire_tool_results)
     builder.add_node("llm", call_llm)
     if plan_mode:
         builder.add_node("plan_llm", call_plan_llm)
@@ -255,7 +293,12 @@ def build_graph(
 
     # 图从 START 进入 llm；启用 plan 时先进入计划阶段。
     if plan_mode:
-        builder.add_edge(START, "plan_llm")
+        builder.add_edge(START, "expire_tool_results")
+        builder.add_conditional_edges(
+            "expire_tool_results",
+            _route_after_tool_result_expiry,
+            {"llm": "llm", "plan_llm": "plan_llm"},
+        )
         builder.add_conditional_edges(
             "plan_llm",
             lambda state: "execute_plan_tools"
@@ -266,14 +309,11 @@ def build_graph(
                 "review_plan": "review_plan",
             },
         )
-        builder.add_edge("execute_plan_tools", "plan_llm")
-        builder.add_conditional_edges(
-            "review_plan",
-            lambda state: "llm" if state.get("plan_approved") else "plan_llm",
-            {"llm": "llm", "plan_llm": "plan_llm"},
-        )
+        builder.add_edge("execute_plan_tools", "expire_tool_results")
+        builder.add_edge("review_plan", "expire_tool_results")
     else:
-        builder.add_edge(START, "llm")
+        builder.add_edge(START, "expire_tool_results")
+        builder.add_edge("expire_tool_results", "llm")
 
     # 如果上一条 AIMessage 有 tool_calls，就进入工具状态机；否则结束。
     builder.add_conditional_edges(
@@ -299,7 +339,7 @@ def build_graph(
     builder.add_edge("approval_gate", "execute_tools")
 
     # 工具执行完以后回到 llm。模型会看到 ToolMessage，再决定继续调用工具还是输出最终答案。
-    builder.add_edge("execute_tools", "llm")
+    builder.add_edge("execute_tools", "expire_tool_results")
     builder.add_edge("summarize_and_compact", END)
 
     if checkpointer is not None:
@@ -313,6 +353,24 @@ def build_graph(
     # LangGraph 会从 checkpointer 取出旧 State，再把新消息追加进去。
     checkpointer = MemorySaver()
     return builder.compile(checkpointer=checkpointer)
+
+
+def _route_after_tool_result_expiry(state: AgentState) -> str:
+    """plan 模式下区分继续计划阶段还是进入主执行模型。"""
+    if not state.get("plan_approved"):
+        return "plan_llm"
+
+    messages = state.get("messages", [])
+    last_message = messages[-1] if messages else None
+    if isinstance(last_message, ToolMessage):
+        return "llm"
+    if (
+        isinstance(last_message, HumanMessage)
+        and isinstance(last_message.content, str)
+        and last_message.content.startswith("用户已审核通过计划书")
+    ):
+        return "llm"
+    return "plan_llm"
 
 
 def _route_after_llm(
@@ -480,7 +538,7 @@ def stream_answer(
                     break
 
                 for update in data.values():
-                    for message in update.get("messages", []):
+                    for message in _update_messages(update):
                         if isinstance(message, AIMessage):
                             final_message = message
             if not interrupted:
@@ -553,11 +611,13 @@ def stream_answer_until_interrupt(
                 )
 
             for node_name, update in data.items():
+                if not isinstance(update, dict):
+                    continue
                 if node_name == "classify_tool_calls":
                     tool_calls = _channel_tool_calls_from_classification(update)
                     if tool_calls:
                         on_tool_calls(tool_calls)
-                for message in update.get("messages", []):
+                for message in _update_messages(update):
                     if isinstance(message, AIMessage):
                         final_message = message
 
@@ -730,7 +790,7 @@ def _stream_debug_graph_to_console(
                     update,
                     suppress_ai_content=streamed_for_current_update,
                 )
-                for message in update.get("messages", []):
+                for message in _update_messages(update):
                     if isinstance(message, AIMessage):
                         final_message = message
             streamed_for_current_update = False
@@ -784,7 +844,7 @@ def _stream_graph_to_console(
                 break
 
             for update in data.values():
-                for message in update.get("messages", []):
+                for message in _update_messages(update):
                     if isinstance(message, AIMessage):
                         final_message = message
         if not interrupted:
@@ -835,12 +895,23 @@ def _extract_stream_text(message: BaseMessage) -> str:
     return "".join(parts)
 
 
+def _update_messages(update: Any) -> list[BaseMessage]:
+    """从 LangGraph 节点更新中提取消息，兼容 no-op 节点的空更新。"""
+    if not isinstance(update, dict):
+        return []
+    messages = update.get("messages", [])
+    return messages if isinstance(messages, list) else []
+
+
 def _print_debug_update(
-    update: dict,
+    update: dict | None,
     suppress_ai_content: bool = False,
 ) -> None:
     """打印 debug stream 中一个节点的状态更新。"""
-    for message in update.get("messages", []):
+    if not isinstance(update, dict):
+        return
+
+    for message in _update_messages(update):
         print(
             _format_message(
                 message,
@@ -861,6 +932,11 @@ def _print_debug_update(
     if isinstance(compaction, dict):
         print("context_compaction:")
         print(json.dumps(compaction, ensure_ascii=False, indent=2))
+
+    tool_result_compaction = update.get("tool_result_compaction")
+    if isinstance(tool_result_compaction, dict):
+        print("tool_result_compaction:")
+        print(json.dumps(tool_result_compaction, ensure_ascii=False, indent=2))
 
 
 def _prompt_for_interrupt_resume(interrupts) -> dict[str, object]:
